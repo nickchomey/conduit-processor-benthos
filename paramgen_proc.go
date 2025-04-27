@@ -8,28 +8,17 @@ import (
 )
 
 const (
-	ProcessorConfigField     = "field"
-	ProcessorConfigThreshold = "threshold"
+	ProcessorConfigBenthosYAML = "benthosYAML"
 )
 
 func (ProcessorConfig) Parameters() map[string]config.Parameter {
 	return map[string]config.Parameter{
-		ProcessorConfigField: {
+		ProcessorConfigBenthosYAML: {
 			Default:     "",
-			Description: "Field is the target field that will be set.",
+			Description: "BenthosYAML is the YAML configuration for the Benthos pipeline",
 			Type:        config.ParameterTypeString,
 			Validations: []config.Validation{
 				config.ValidationRequired{},
-				config.ValidationExclusion{List: []string{".Position"}},
-			},
-		},
-		ProcessorConfigThreshold: {
-			Default:     "",
-			Description: "Threshold is the threshold for filtering the record.",
-			Type:        config.ParameterTypeInt,
-			Validations: []config.Validation{
-				config.ValidationRequired{},
-				config.ValidationGreaterThan{V: 0},
 			},
 		},
 	}

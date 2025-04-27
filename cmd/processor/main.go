@@ -8,5 +8,5 @@ import (
 )
 
 func main() {
-	sdk.Run(benthos.NewProcessor())
+	sdk.Run(benthos.NewBenthosProcessor())
 }

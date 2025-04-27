@@ -1,0 +1,48 @@
+---
+version: 2.2
+pipelines:
+  - id: benthos-advanced-pipeline
+    status: running
+    description: > 
+      An advanced example pipeline that uses the Benthos processor with multiple transformations.
+      
+      It reads JSON data from the `json-example.in` file, processes it through Benthos
+      with multiple transformations, and writes the results to the `json-example.out` file.
+    connectors:
+      - id: json-file-source
+        type: source
+        plugin: "builtin:file"
+        name: json-file-source
+        settings:
+          path: ./json-example.in
+      - id: json-file-destination
+        type: destination
+        plugin: "builtin:file"
+        name: json-file-destination
+        settings:
+          path: ./json-example.out
+    processors:
+      - id: benthos-json-processor
+        plugin: "benthos"
+        settings:
+          benthosYAML: |
+            pipeline:
+              processors:
+                # Parse the JSON payload
+                - mapping: |
+                    let parsed = content().payload.after.string().parse_json()
+                    
+                    # Transform the data
+                    let transformed = {
+                      "id": parsed.id,
+                      "name": parsed.name.uppercase(),
+                      "summary": "User " + parsed.name + " is " + parsed.age.string() + " years old",
+                      "processed_at": now().format_timestamp()
+                    }
+                    
+                    # Set the transformed data back to the payload
+                    root.payload.after = transformed.encode_json().bytes()
+                    
+                    # Add metadata
+                    root.metadata.processed_by = "benthos"
+                    root.metadata.processor_version = "v0.1.0"

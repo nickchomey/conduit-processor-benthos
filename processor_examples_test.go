@@ -1,17 +1,29 @@
 package benthos
 
 import (
+	"fmt"
+
 	"github.com/conduitio/conduit-commons/config"
 	"github.com/conduitio/conduit-commons/opencdc"
 	sdk "github.com/conduitio/conduit-processor-sdk"
 )
 
 func Example_uppercase() {
-	p := NewProcessor()
+	p := NewBenthosProcessor()
 
 	// Configure the processor with a simple uppercase transformation
 	p.Configure(nil, config.Config{
-		"benthosYAML": "uppercase",
+		"benthosYAML": `
+input:
+  generate:
+    mapping: 'root = {"test":"data"}'
+    interval: ""
+    count: 1
+pipeline:
+  processors:
+    - mapping: |
+        root.payload.after = content().payload.after.string().uppercase().bytes()
+`,
 	})
 
 	// Open the processor
@@ -33,8 +45,8 @@ func Example_uppercase() {
 
 	// Print the result
 	result := results[0].(sdk.SingleRecord)
-	println("Processed payload:", string(result.Payload.After.Bytes()))
-	println("Metadata:", result.Metadata["processed_by"])
+	fmt.Println("Processed payload:", string(result.Payload.After.Bytes()))
+	fmt.Println("Metadata:", result.Metadata["processed_by"])
 
 	// Output:
 	// Processed payload: HELLO WORLD
@@ -42,12 +54,17 @@ func Example_uppercase() {
 }
 
 func Example_complexTransformation() {
-	p := NewProcessor()
+	p := NewBenthosProcessor()
 
 	// In a real implementation, this would be a Benthos YAML configuration
 	// that defines a complex transformation pipeline
 	p.Configure(nil, config.Config{
 		"benthosYAML": `
+input:
+  generate:
+    mapping: 'root = {"test":"data"}'
+    interval: ""
+    count: 1
 pipeline:
   processors:
     - mapping: |
@@ -79,7 +96,7 @@ pipeline:
 	// In a real implementation with actual Benthos integration,
 	// the result would be transformed according to the YAML config
 	result := results[0].(sdk.SingleRecord)
-	println("Processed by:", result.Metadata["processed_by"])
+	fmt.Println("Processed by:", result.Metadata["processed_by"])
 
 	// Output:
 	// Processed by: benthos
