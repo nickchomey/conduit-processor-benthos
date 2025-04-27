@@ -1,4 +1,4 @@
-module github.com/conduitio/conduit-processor-processorname/tools
+module github.com/nickchomey/conduit-processor-benthos/tools
 
 go 1.24.2
 

@@ -21,7 +21,7 @@
 .vscode
 
 # Binary, built with `make build`
-/conduit-processor-processorname.wasm
+/conduit-processor-benthos.wasm
 
 ### OS ###
 .DS_Store
