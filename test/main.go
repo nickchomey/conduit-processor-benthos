@@ -13,5 +13,5 @@ func main() {
 
 	cfg.ProcessorPlugins["benthos"] = builtin.Constructor(benthos.NewBenthosProcessor)
 
-	cli.Run(cfg)
+ 	cli.Run(cfg)
 }

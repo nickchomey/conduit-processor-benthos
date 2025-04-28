@@ -93,7 +93,7 @@ func (p *BenthosProcessor) Open(ctx context.Context) error {
 	// Register our custom input and output for Benthos
 	// These need to match the inproc names in the YAML configuration
 	err := service.RegisterInput(
-		"conduit_processor_input",
+		"conduit_processor_input", // Name used for registration
 		service.NewConfigSpec(),
 		func(conf *service.ParsedConfig, mgr *service.Resources) (service.Input, error) {
 			// Wrap with AutoRetryNacks for automatic retry of failed messages
@@ -105,7 +105,7 @@ func (p *BenthosProcessor) Open(ctx context.Context) error {
 	}
 
 	err = service.RegisterOutput(
-		"conduit_processor_output",
+		"conduit_processor_output", // Name used for registration
 		service.NewConfigSpec(),
 		func(conf *service.ParsedConfig, mgr *service.Resources) (out service.Output, maxInFlight int, err error) {
 			return p, 1, nil
@@ -134,7 +134,7 @@ processor_resources:
       # This mapping will process the record
       # It can access the record fields via content()
       root = this
-      root.payload.after = this.payload.after.string().uppercase()
+      root.payload.after = this.payload.after.string().uppercase().bytes()
 
       # Add metadata to show it was processed by Benthos
       root.metadata.processed_by = "benthos"
@@ -153,9 +153,10 @@ output:
 
 	sdk.Logger(ctx).Debug().Str("config", completeYAML).Msg("Using Benthos configuration")
 
+	// Set the main pipeline/processor configuration
 	err = builder.SetYAML(completeYAML)
 	if err != nil {
-		return fmt.Errorf("failed parsing Benthos YAML config: %w", err)
+		return fmt.Errorf("failed parsing Benthos pipeline YAML config: %w", err)
 	}
 
 	// We don't need to add custom input and output because they're already defined in the YAML
@@ -174,10 +175,15 @@ output:
 
 	go func() {
 		sdk.Logger(ctx).Debug().Msg("Running Benthos stream...")
-		err = stream.Run(benthosCtx)
-		if err != nil {
-			sdk.Logger(ctx).Err(err).Msg("Benthos stream error")
-			p.errC <- err
+		streamErr := stream.Run(benthosCtx) // Use a different variable name
+		if streamErr != nil {
+			sdk.Logger(ctx).Err(streamErr).Msg("Benthos stream error")
+			// Use non-blocking send to avoid deadlock if channel is full/closed
+			select {
+			case p.errC <- streamErr:
+			default:
+				sdk.Logger(ctx).Err(streamErr).Msg("Benthos stream error channel full or closed, dropping error")
+			}
 		}
 	}()
 
@@ -240,13 +246,19 @@ func (p *BenthosProcessor) Teardown(ctx context.Context) error {
 	return nil
 }
 
-// Implement service.Input interface for Benthos
-
+// Implement service.Input and service.Output interface for Benthos
+// Both have Connect and Close
 func (p *BenthosProcessor) Connect(ctx context.Context) error {
 	sdk.Logger(ctx).Debug().Msg("Benthos input connect")
 	return nil
 }
 
+func (p *BenthosProcessor) Close(ctx context.Context) error {
+	sdk.Logger(ctx).Debug().Msg("Benthos input close")
+	return nil
+}
+
+// service.Input expects Read
 func (p *BenthosProcessor) Read(ctx context.Context) (*service.Message, service.AckFunc, error) {
 	sdk.Logger(ctx).Debug().Msg("Benthos input read")
 
@@ -257,30 +269,34 @@ func (p *BenthosProcessor) Read(ctx context.Context) (*service.Message, service.
 		msg := p.toMessage(record)
 
 		return msg, func(ctx context.Context, err error) error {
+			// This AckFunc is called by Benthos after it finishes
+			// processing (or fails to process) the message.
 			if err != nil {
-				p.results <- processResult{err: err}
+				sdk.Logger(ctx).Err(err).Msg("Benthos Nack received")
+				// Benthos failed to process the message, send the error back
+				p.results <- processResult{err: fmt.Errorf("benthos processing failed: %w", err)}
 			}
+			// If err is nil, it means Benthos processed successfully.
+			// The successful result is already sent by the Write method.
 			return nil
 		}, nil
+	case err := <-p.errC: // Check for stream errors
+		return nil, nil, fmt.Errorf("benthos stream error during read: %w", err)
 	case <-ctx.Done():
 		return nil, nil, ctx.Err()
 	}
 }
 
-func (p *BenthosProcessor) Close(ctx context.Context) error {
-	sdk.Logger(ctx).Debug().Msg("Benthos input close")
-	return nil
-}
-
-// Implement service.Output interface for Benthos
-
+// service.Output expects Write
 func (p *BenthosProcessor) Write(ctx context.Context, msg *service.Message) error {
 	sdk.Logger(ctx).Debug().Msg("Benthos output write")
 
 	// Convert Benthos message back to Conduit record
 	record, err := p.fromMessage(msg)
 	if err != nil {
-		return err
+		// Send the conversion error back through the results channel
+		p.results <- processResult{err: fmt.Errorf("failed converting Benthos message to record: %w", err)}
+		return err // Return error to Benthos to signal failure
 	}
 
 	// Send the processed record back
@@ -293,30 +309,7 @@ func (p *BenthosProcessor) Write(ctx context.Context, msg *service.Message) erro
 
 func (p *BenthosProcessor) toMessage(record opencdc.Record) *service.Message {
 	msg := service.NewMessage(nil)
-
-	// Convert record to structured data for Benthos
-	data := map[string]interface{}{
-		"position":  record.Position,
-		"operation": record.Operation.String(),
-		"metadata":  record.Metadata,
-	}
-
-	// Handle Key
-	if record.Key != nil {
-		data["key"] = record.Key.Bytes()
-	}
-
-	// Handle Payload
-	payload := map[string]interface{}{}
-	if record.Payload.Before != nil {
-		payload["before"] = record.Payload.Before.Bytes()
-	}
-	if record.Payload.After != nil {
-		payload["after"] = record.Payload.After.Bytes()
-	}
-	data["payload"] = payload
-
-	msg.SetStructured(data)
+	msg.SetStructured(record.Map())
 	return msg
 }
 
@@ -327,80 +320,17 @@ func (p *BenthosProcessor) fromMessage(msg *service.Message) (opencdc.Record, er
 		return opencdc.Record{}, fmt.Errorf("failed to get structured data from Benthos message: %w", err)
 	}
 
-	data, ok := structured.(map[string]interface{})
+	// Assert the type of structured to map[string]interface{}
+	structuredMap, ok := structured.(map[string]interface{})
 	if !ok {
-		return opencdc.Record{}, fmt.Errorf("Benthos message is not a map")
+		return opencdc.Record{}, fmt.Errorf("failed to assert Benthos message structured data to map[string]interface{}, got type %T", structured)
 	}
 
-	// Create a new record
+	// Create record and populate it with the map data
 	record := opencdc.Record{}
-
-	// Set Position
-	if pos, ok := data["position"]; ok {
-		if posStr, ok := pos.(string); ok {
-			record.Position = opencdc.Position(posStr)
-		}
+	err = record.Unmap(structuredMap)
+	if err != nil {
+		return opencdc.Record{}, fmt.Errorf("failed to convert Benthos structured to opencdc.Record : %w", err)
 	}
-
-	// Set Operation
-	if op, ok := data["operation"]; ok {
-		if opStr, ok := op.(string); ok {
-			// Convert string to Operation
-			switch opStr {
-			case "create":
-				record.Operation = opencdc.OperationCreate
-			case "update":
-				record.Operation = opencdc.OperationUpdate
-			case "delete":
-				record.Operation = opencdc.OperationDelete
-			case "snapshot":
-				record.Operation = opencdc.OperationSnapshot
-			default:
-				record.Operation = opencdc.OperationCreate
-			}
-		} else {
-			// Default to create if not specified
-			record.Operation = opencdc.OperationCreate
-		}
-	}
-
-	// Set Metadata
-	if meta, ok := data["metadata"]; ok {
-		if metaMap, ok := meta.(map[string]interface{}); ok {
-			record.Metadata = make(opencdc.Metadata)
-			for k, v := range metaMap {
-				if vStr, ok := v.(string); ok {
-					record.Metadata[k] = vStr
-				}
-			}
-		}
-	}
-
-	// Set Key
-	if key, ok := data["key"]; ok {
-		if keyBytes, ok := key.([]byte); ok {
-			record.Key = opencdc.RawData(keyBytes)
-		}
-	}
-
-	// Set Payload
-	if payload, ok := data["payload"]; ok {
-		if payloadMap, ok := payload.(map[string]interface{}); ok {
-			// Set Before
-			if before, ok := payloadMap["before"]; ok {
-				if beforeBytes, ok := before.([]byte); ok {
-					record.Payload.Before = opencdc.RawData(beforeBytes)
-				}
-			}
-
-			// Set After
-			if after, ok := payloadMap["after"]; ok {
-				if afterBytes, ok := after.([]byte); ok {
-					record.Payload.After = opencdc.RawData(afterBytes)
-				}
-			}
-		}
-	}
-
 	return record, nil
 }
