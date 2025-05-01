@@ -64,14 +64,14 @@ type conduitOutputConfig struct {
 	InstanceID string `json:"instance_id"`
 }
 
-// conduitInputWrapper implements service.Input, reading from a specific processor's channel.
-type conduitInputWrapper struct {
+// conduitBatchInputWrapper implements service.BatchInput, reading from a specific processor's channel.
+type conduitBatchInputWrapper struct {
 	p      *BenthosProcessor
 	logger log.CtxLogger
 }
 
-// conduitOutputWrapper implements service.Output, writing to a specific processor's channel.
-type conduitOutputWrapper struct {
+// conduitBatchOutputWrapper implements service.BatchOutput, writing to a specific processor's channel.
+type conduitBatchOutputWrapper struct {
 	p      *BenthosProcessor
 	logger log.CtxLogger
 }
@@ -81,11 +81,11 @@ func init() {
 	inputConfSpec := service.NewConfigSpec().
 		Field(service.NewStringField("instance_id").Description("The unique ID of the processor instance."))
 
-	err := service.RegisterInput(
+	err := service.RegisterBatchInput(
 		"conduit_processor_input",
 		inputConfSpec,
-		func(conf *service.ParsedConfig, mgr *service.Resources) (service.Input, error) {
-			// Fix: Use FieldString instead of Unmarshal
+		func(conf *service.ParsedConfig, mgr *service.Resources) (service.BatchInput, error) {
+			// Get the instance ID from the config
 			instanceID, err := conf.FieldString("instance_id")
 			if err != nil {
 				return nil, fmt.Errorf("failed to get instance_id for conduit_processor_input: %w", err)
@@ -102,28 +102,28 @@ func init() {
 				return nil, fmt.Errorf("processor instance %q not found in registry", instanceID)
 			}
 
-			// Wrap with AutoRetryNacks for automatic retry of failed messages
-			return service.AutoRetryNacks(&conduitInputWrapper{p: p, logger: p.logger.WithComponent("benthos.input")}), nil
+			// Wrap with AutoRetryNacksBatched for automatic retry of failed batches
+			return service.AutoRetryNacksBatched(&conduitBatchInputWrapper{p: p, logger: p.logger.WithComponent("benthos.input")}), nil
 		},
 	)
 	if err != nil {
-		panic(fmt.Sprintf("failed registering Benthos input 'conduit_processor_input': %v", err))
+		panic(fmt.Sprintf("failed registering Benthos batch input 'conduit_processor_input': %v", err))
 	}
 
 	outputConfSpec := service.NewConfigSpec().
 		Field(service.NewStringField("instance_id").Description("The unique ID of the processor instance."))
 
-	err = service.RegisterOutput(
+	err = service.RegisterBatchOutput(
 		"conduit_processor_output",
 		outputConfSpec,
-		func(conf *service.ParsedConfig, mgr *service.Resources) (out service.Output, maxInFlight int, err error) {
-			// Fix: Use FieldString instead of Unmarshal
+		func(conf *service.ParsedConfig, mgr *service.Resources) (out service.BatchOutput, batchPolicy service.BatchPolicy, maxInFlight int, err error) {
+			// Get the instance ID from the config
 			instanceID, err := conf.FieldString("instance_id")
 			if err != nil {
-				return nil, 0, fmt.Errorf("failed to get instance_id for conduit_processor_output: %w", err)
+				return nil, service.BatchPolicy{}, 0, fmt.Errorf("failed to get instance_id for conduit_processor_output: %w", err)
 			}
 			if instanceID == "" {
-				return nil, 0, fmt.Errorf("instance_id is required for conduit_processor_output")
+				return nil, service.BatchPolicy{}, 0, fmt.Errorf("instance_id is required for conduit_processor_output")
 			}
 
 			registryMutex.RLock()
@@ -131,14 +131,16 @@ func init() {
 			registryMutex.RUnlock()
 
 			if !ok {
-				return nil, 0, fmt.Errorf("processor instance %q not found in registry", instanceID)
+				return nil, service.BatchPolicy{}, 0, fmt.Errorf("processor instance %q not found in registry", instanceID)
 			}
 
-			return &conduitOutputWrapper{p: p, logger: p.logger.WithComponent("benthos.output")}, 1, nil
+			// Return the output wrapper with no batching policy (we handle batching ourselves)
+			// and a max in-flight of 1 (we process one batch at a time)
+			return &conduitBatchOutputWrapper{p: p, logger: p.logger.WithComponent("benthos.output")}, service.BatchPolicy{}, 1, nil
 		},
 	)
 	if err != nil {
-		panic(fmt.Sprintf("failed registering Benthos output 'conduit_processor_output': %v", err))
+		panic(fmt.Sprintf("failed registering Benthos batch output 'conduit_processor_output': %v", err))
 	}
 }
 
@@ -150,9 +152,9 @@ type BenthosProcessor struct {
 	config ProcessorConfig
 
 	// channels for communication with Benthos
-	records chan opencdc.Record
-	results chan processResult
-	errC    chan error // For receiving fatal errors from the Benthos stream goroutine
+	recordBatches chan []opencdc.Record
+	resultBatches chan batchProcessResult
+	errC          chan error // For receiving fatal errors from the Benthos stream goroutine
 
 	// mutex to protect concurrent access during stream updates and processing
 	// Use RWMutex: multiple readers (Process) can run concurrently,
@@ -169,45 +171,134 @@ type BenthosProcessor struct {
 	logger log.CtxLogger
 }
 
-type processResult struct {
-	record opencdc.Record
-	err    error
+type batchProcessResult struct {
+	records []opencdc.Record
+	err     error
 }
 
 type ProcessorConfig struct {
 	// BenthosYAML is the YAML configuration for the Benthos *processors* section
 	BenthosYAML string `json:"benthosYAML" validate:"required"`
+
+	// BatchSize controls the maximum number of records to process in a single Benthos batch
+	// Higher values can improve throughput but may increase memory usage
+	BatchSize int `json:"batchSize" default:"100" validate:"gt=0"`
+
+	// ChannelBufferSize controls the size of internal channels for communication
+	// Higher values can improve throughput but use more memory
+	ChannelBufferSize int `json:"channelBufferSize" default:"10"`
+
+	// ThreadCount controls the number of parallel processing threads in the Benthos pipeline
+	// Higher values can improve throughput for CPU-bound processors
+	ThreadCount int `json:"threadCount" default:"1"`
+
+	// LogLevel controls the verbosity of Benthos internal logs
+	// Valid values: NONE, ERROR, WARN, INFO, DEBUG, TRACE
+	LogLevel string `json:"logLevel" default:"INFO" validate:"oneof=NONE ERROR WARN INFO DEBUG TRACE"`
 }
 
 // NewBenthosProcessor creates a new Benthos processor with the provided logger.
 func NewBenthosProcessor(logger log.CtxLogger) *BenthosProcessor {
+	// Default values - will be used if not overridden in Configure
+	const defaultBatchSize = 100
+	const defaultChannelBufferSize = 10
+
 	return &BenthosProcessor{
-		records: make(chan opencdc.Record, 10), // Small buffer for better performance
-		results: make(chan processResult, 10),  // Small buffer for better performance
-		errC:    make(chan error, 1),           // Buffered to avoid blocking the stream goroutine on error
-		logger:  logger.WithComponent("processor.benthos"),
+		// All channels will be initialized in Configure
+		logger: logger.WithComponent("processor.benthos"),
+		// Default config values - will be overridden in Configure
+		config: ProcessorConfig{
+			BatchSize:         defaultBatchSize,
+			ChannelBufferSize: defaultChannelBufferSize,
+			ThreadCount:       1,
+			LogLevel:          "INFO",
+		},
 	}
 }
 
 func (p *BenthosProcessor) Specification() (sdk.Specification, error) {
-	return sdk.Specification{
+	// Create a Benthos-style configuration specification
+	spec := sdk.Specification{
 		Name:        "benthos",
 		Summary:     "Process records through a Benthos pipeline",
-		Description: "A processor that passes Conduit records through a Benthos pipeline for advanced processing",
 		Version:     "v0.1.0",
 		Author:      "Conduit",
+		Description: benthosProcessorDescription(),
 		Parameters:  ProcessorConfig{}.Parameters(),
-	}, nil
+	}
+
+	// Add examples in the description since sdk.Specification doesn't have an Examples field
+
+	return spec, nil
+}
+
+// benthosProcessorDescription returns a concise description of the Benthos processor
+func benthosProcessorDescription() string {
+	return `Integrates the Benthos stream processing library with Conduit, allowing you to leverage Benthos's extensive library of processors to transform, filter, and enrich your data.
+
+Configure with YAML that defines a Benthos processing pipeline. Supports all Benthos processors including mapping, bloblang, json, filter, http, and more.
+
+For detailed documentation and examples, see the README or visit the Benthos documentation at https://benthos.dev/docs/components/processors/about/`
 }
 
 func (p *BenthosProcessor) Configure(ctx context.Context, cfg config.Config) error {
 	p.logger.Debug(ctx).Msg("Configuring Benthos processor...")
+
 	// Parse and store the processor-specific YAML provided by the user/Conduit config
 	err := sdk.ParseConfig(ctx, cfg, &p.config, ProcessorConfig{}.Parameters())
 	if err != nil {
 		return fmt.Errorf("failed to parse configuration: %w", err)
 	}
-	p.logger.Debug(ctx).Str("processorYAML", p.config.BenthosYAML).Msg("Benthos processor YAML configured")
+
+	// Validate configuration values
+	if p.config.BatchSize <= 0 {
+		p.logger.Warn(ctx).Int("batch_size", p.config.BatchSize).Msg("Invalid batch size, using default value of 100")
+		p.config.BatchSize = 100
+	}
+
+	if p.config.ChannelBufferSize <= 0 {
+		p.logger.Warn(ctx).Int("channel_buffer_size", p.config.ChannelBufferSize).Msg("Invalid channel buffer size, using default value of 10")
+		p.config.ChannelBufferSize = 10
+	}
+
+	if p.config.ThreadCount <= 0 {
+		p.logger.Warn(ctx).Int("thread_count", p.config.ThreadCount).Msg("Invalid thread count, using default value of 1")
+		p.config.ThreadCount = 1
+	}
+
+	// Validate log level
+	validLogLevels := map[string]bool{
+		"NONE":  true,
+		"ERROR": true,
+		"WARN":  true,
+		"INFO":  true,
+		"DEBUG": true,
+		"TRACE": true,
+	}
+	if !validLogLevels[p.config.LogLevel] {
+		p.logger.Warn(ctx).Str("log_level", p.config.LogLevel).Msg("Invalid log level, using default value of INFO")
+		p.config.LogLevel = "INFO"
+	}
+
+	// No additional validation needed
+
+	// Initialize channels with the configured buffer size
+	// This is safe during Configure as the processor isn't running yet
+	p.recordBatches = make(chan []opencdc.Record, p.config.ChannelBufferSize)
+	p.resultBatches = make(chan batchProcessResult, p.config.ChannelBufferSize)
+
+	p.logger.Debug(ctx).
+		Int("channel_buffer_size", p.config.ChannelBufferSize).
+		Msg("Initialized channels with configured buffer size")
+
+	p.logger.Info(ctx).
+		Str("benthosYAML", p.config.BenthosYAML).
+		Int("batchSize", p.config.BatchSize).
+		Int("channelBufferSize", p.config.ChannelBufferSize).
+		Int("threadCount", p.config.ThreadCount).
+		Str("logLevel", p.config.LogLevel).
+		Msg("Benthos processor configured")
+
 	return nil
 }
 
@@ -256,11 +347,25 @@ func (p *BenthosProcessor) buildAndRunBenthosStream(ctx context.Context, process
 	builder := service.NewStreamBuilder()
 	builder.DisableLinting() // Disable linting as we construct programmatically
 
+	// Set logging level based on configuration
+	loggerYAML := fmt.Sprintf("level: %s", p.config.LogLevel)
+	err := builder.SetLoggerYAML(loggerYAML)
+	if err != nil {
+		p.logger.Warn(ctx).Err(err).Str("loggerYAML", loggerYAML).Msg("Failed to set Benthos logger level, using default")
+	}
+
+	// Set thread count for the pipeline
+	if p.config.ThreadCount > 1 {
+		// There's no direct SetPipelineYAML method, so we'll modify the threads directly
+		builder.SetThreads(p.config.ThreadCount)
+		p.logger.Debug(ctx).Int("threadCount", p.config.ThreadCount).Msg("Set Benthos thread count")
+	}
+
 	// Interpolate instance ID into the base config
 	interpolatedBaseYAML := strings.ReplaceAll(baseBenthosConfigYAML, "${INSTANCE_ID}", p.instanceID)
 
 	// Set the base configuration (input/output wrappers)
-	err := builder.SetYAML(interpolatedBaseYAML)
+	err = builder.SetYAML(interpolatedBaseYAML)
 	if err != nil {
 		return nil, fmt.Errorf("failed parsing base Benthos YAML config: %w", err)
 	}
@@ -390,70 +495,83 @@ func (p *BenthosProcessor) Process(ctx context.Context, records []opencdc.Record
 		return out
 	}
 
-	// If the stream is running, proceed with processing
+	// Process records in batches according to the configured batch size
 	out := make([]sdk.ProcessedRecord, 0, len(records))
-	for i, record := range records {
-		// Process each record through Benthos
-		// Note: processRecord handles its own locking internally if needed, but currently relies on the outer RLock
-		processedRecord, err := p.processRecord(ctx, record)
+
+	// Process records in batches
+	for i := 0; i < len(records); i += p.config.BatchSize {
+		// Calculate end index for current batch
+		end := min(i+p.config.BatchSize, len(records))
+
+		batchRecords := records[i:end]
+		p.logger.Debug(ctx).Int("batch_size", len(batchRecords)).Int("start_index", i).Int("end_index", end-1).Msg("Processing batch")
+
+		// Process this batch
+		processedRecords, err := p.processBatch(ctx, batchRecords)
 		if err != nil {
-			// If processRecord returns an error, wrap it in an sdk.ErrorRecord
-			p.logger.Error(ctx).Err(err).Int("record_index", i).Msg("Failed processing record through Benthos")
-			out = append(out, sdk.ErrorRecord{
-				Error: fmt.Errorf("failed processing record %d: %w", i, err),
-				// Optionally include the original record if needed for error handling downstream
-				// Record: record,
-			})
-			// Decide if we should continue processing other records in the batch
-			// For now, we continue, but you might want to return early on certain errors.
-			continue
+			// If batch processing fails, return errors for all records in this batch
+			p.logger.Error(ctx).Err(err).Int("start_index", i).Int("end_index", end-1).Msg("Failed processing batch through Benthos")
+			for j := range batchRecords {
+				out = append(out, sdk.ErrorRecord{
+					Error: fmt.Errorf("batch processing failed (index %d): %w", i+j, err),
+				})
+			}
+		} else {
+			// Convert the processed records to sdk.ProcessedRecord format
+			for _, record := range processedRecords {
+				out = append(out, sdk.SingleRecord(record))
+			}
 		}
-		// If successful, wrap in sdk.SingleRecord
-		out = append(out, sdk.SingleRecord(processedRecord))
 	}
 
+	p.logger.Debug(ctx).
+		Int("total_records", len(records)).
+		Int("success_count", len(out)).
+		Int("batch_size_config", p.config.BatchSize).
+		Msg("All batches processing complete")
+
 	if len(out) != len(records) {
-		p.logger.Warn(ctx).Int("input_count", len(records)).Int("output_count", len(out)).Msg("Number of processed records does not match input count due to errors.")
+		p.logger.Warn(ctx).Int("input_count", len(records)).Int("output_count", len(out)).Msg("Number of processed records does not match input count.")
 	}
 
 	return out
 }
 
-// processRecord handles sending a single record to Benthos and receiving the result.
+// processBatch handles sending a batch of records to Benthos and receiving the results.
 // It assumes the caller holds at least a read lock (p.mu.RLock).
-func (p *BenthosProcessor) processRecord(ctx context.Context, record opencdc.Record) (opencdc.Record, error) {
+func (p *BenthosProcessor) processBatch(ctx context.Context, records []opencdc.Record) ([]opencdc.Record, error) {
 	// Double-check stream status under the lock, though the outer Process call should handle this.
 	if p.benthosStream == nil {
-		return opencdc.Record{}, fmt.Errorf("Benthos stream is not running (instance ID: %s)", p.instanceID)
+		return nil, fmt.Errorf("Benthos stream is not running (instance ID: %s)", p.instanceID)
 	}
 
-	// Send the record to Benthos input channel
+	// Send the batch to Benthos input channel
 	select {
-	case p.records <- record:
-		p.logger.Trace(ctx).RawJSON("record_key", record.Key.Bytes()).Msg("Record sent to Benthos input channel")
+	case p.recordBatches <- records:
+		p.logger.Debug(ctx).Int("batch_size", len(records)).Msg("Record batch sent to Benthos input channel")
 	case err := <-p.errC:
-		p.logger.Error(ctx).Err(err).Msg("Received Benthos stream error while trying to send record")
-		return opencdc.Record{}, fmt.Errorf("Benthos stream error: %w", err)
+		p.logger.Error(ctx).Err(err).Msg("Received Benthos stream error while trying to send batch")
+		return nil, fmt.Errorf("Benthos stream error: %w", err)
 	case <-ctx.Done():
-		p.logger.Warn(ctx).Msg("Context cancelled while trying to send record to Benthos")
-		return opencdc.Record{}, ctx.Err()
+		p.logger.Warn(ctx).Msg("Context cancelled while trying to send batch to Benthos")
+		return nil, ctx.Err()
 	}
 
-	// Wait for the processed record or an error from the Benthos output channel
+	// Wait for the processed batch or an error from the Benthos output channel
 	select {
-	case result := <-p.results:
+	case result := <-p.resultBatches:
 		if result.err != nil {
-			p.logger.Error(ctx).Err(result.err).RawJSON("record_key", record.Key.Bytes()).Msg("Received processing error from Benthos output channel")
-			return opencdc.Record{}, result.err // Propagate the processing error
+			p.logger.Error(ctx).Err(result.err).Msg("Received processing error from Benthos output channel")
+			return nil, result.err // Propagate the processing error
 		}
-		p.logger.Trace(ctx).RawJSON("record_key", result.record.Key.Bytes()).Msg("Received processed record from Benthos output channel")
-		return result.record, nil
+		p.logger.Debug(ctx).Int("result_size", len(result.records)).Msg("Received processed batch from Benthos output channel")
+		return result.records, nil
 	case err := <-p.errC:
-		p.logger.Error(ctx).Err(err).Msg("Received Benthos stream error while waiting for result")
-		return opencdc.Record{}, fmt.Errorf("Benthos stream error: %w", err)
+		p.logger.Error(ctx).Err(err).Msg("Received Benthos stream error while waiting for batch result")
+		return nil, fmt.Errorf("Benthos stream error: %w", err)
 	case <-ctx.Done():
-		p.logger.Warn(ctx).Msg("Context cancelled while waiting for Benthos result")
-		return opencdc.Record{}, ctx.Err()
+		p.logger.Warn(ctx).Msg("Context cancelled while waiting for Benthos batch result")
+		return nil, ctx.Err()
 	}
 }
 
@@ -494,108 +612,121 @@ func (p *BenthosProcessor) Teardown(ctx context.Context) error {
 	return nil
 }
 
-// --- Benthos service.Input Implementation (via wrapper) ---
+// --- Benthos service.BatchInput Implementation (via wrapper) ---
 
-func (w *conduitInputWrapper) Connect(ctx context.Context) error {
-	w.logger.Debug(ctx).Msg("Benthos input connected")
+func (w *conduitBatchInputWrapper) Connect(ctx context.Context) error {
+	w.logger.Debug(ctx).Msg("Benthos batch input connected")
 	// No specific connection needed as we use channels
 	return nil
 }
 
-func (w *conduitInputWrapper) Read(ctx context.Context) (*service.Message, service.AckFunc, error) {
-	// This Read method is called by the Benthos stream's input goroutine.
+func (w *conduitBatchInputWrapper) ReadBatch(ctx context.Context) (service.MessageBatch, service.AckFunc, error) {
+	// This ReadBatch method is called by the Benthos stream's input goroutine.
 	// It reads from the specific processor instance's channel.
 	select {
-	case record := <-w.p.records:
-		msg := w.p.toMessage(record) // Use helper from the processor instance
-		w.logger.Trace(ctx).RawJSON("record_key", record.Key.Bytes()).Msg("Benthos input Read providing message")
+	case recordBatch := <-w.p.recordBatches:
+		// Convert each record to a Benthos message
+		messages := make(service.MessageBatch, len(recordBatch))
+		for i, record := range recordBatch {
+			messages[i] = w.p.toMessage(record)
+		}
+
+		w.logger.Debug(ctx).Int("batch_size", len(messages)).Msg("Benthos input ReadBatch providing message batch")
 
 		// The AckFunc captures the specific processor instance 'w.p'
 		ackFn := func(ctx context.Context, err error) error {
 			if err != nil {
-				w.logger.Error(ctx).Err(err).RawJSON("record_key", record.Key.Bytes()).Msg("Benthos Nack received")
+				w.logger.Error(ctx).Err(err).Int("batch_size", len(recordBatch)).Msg("Benthos Nack received for batch")
 				// Send the error back to the processor's results channel
 				// Use non-blocking send
 				select {
-				case w.p.results <- processResult{err: fmt.Errorf("benthos processing failed: %w", err)}:
+				case w.p.resultBatches <- batchProcessResult{err: fmt.Errorf("benthos batch processing failed: %w", err)}:
 				default:
 					w.logger.Warn(ctx).Err(err).Msg("Result channel full or closed, dropping Nack error")
 				}
 			} else {
-				w.logger.Trace(ctx).RawJSON("record_key", record.Key.Bytes()).Msg("Benthos Ack received (result sent via output Write)")
-				// Success is handled by the Write method sending the result.
+				w.logger.Debug(ctx).Int("batch_size", len(recordBatch)).Msg("Benthos Ack received for batch (results sent via output WriteBatch)")
+				// Success is handled by the WriteBatch method sending the results.
 			}
 			return nil
 		}
-		return msg, ackFn, nil
+		return messages, ackFn, nil
 
 	case err := <-w.p.errC: // Check for fatal stream errors
 		// Propagate the error to Benthos so it stops the input
-		w.logger.Error(ctx).Err(err).Msg("Benthos stream error during Read")
+		w.logger.Error(ctx).Err(err).Msg("Benthos stream error during ReadBatch")
 		return nil, nil, fmt.Errorf("benthos stream error: %w", err)
 
 	case <-ctx.Done(): // Context cancelled (Benthos stream shutting down)
-		w.logger.Debug(ctx).Msg("Benthos input Read context cancelled")
+		w.logger.Debug(ctx).Msg("Benthos input ReadBatch context cancelled")
 		return nil, nil, ctx.Err() // Signal clean shutdown
 	}
 }
 
-func (w *conduitInputWrapper) Close(ctx context.Context) error {
-	w.logger.Debug(ctx).Msg("Benthos input closing")
+func (w *conduitBatchInputWrapper) Close(ctx context.Context) error {
+	w.logger.Debug(ctx).Msg("Benthos batch input closing")
 	// No specific closing needed for channels from the input side
 	return nil
 }
 
-// --- Benthos service.Output Implementation (via wrapper) ---
+// --- Benthos service.BatchOutput Implementation (via wrapper) ---
 
-func (w *conduitOutputWrapper) Connect(ctx context.Context) error {
-	w.logger.Debug(ctx).Msg("Benthos output connected")
+func (w *conduitBatchOutputWrapper) Connect(ctx context.Context) error {
+	w.logger.Debug(ctx).Msg("Benthos batch output connected")
 	// No specific connection needed
 	return nil
 }
 
-func (w *conduitOutputWrapper) Write(ctx context.Context, msg *service.Message) error {
-	// This Write method is called by Benthos after processing is complete.
-	// It writes the result back to the specific processor instance's channel.
-	w.logger.Trace(ctx).Msg("Benthos output Write called")
+func (w *conduitBatchOutputWrapper) WriteBatch(ctx context.Context, msgs service.MessageBatch) error {
+	// This WriteBatch method is called by Benthos after processing is complete.
+	// It writes the results back to the specific processor instance's channel.
+	w.logger.Debug(ctx).Int("batch_size", len(msgs)).Msg("Benthos output WriteBatch called")
 
-	record, err := w.p.fromMessage(ctx, msg) // Use helper from the processor instance
-	if err != nil {
-		w.logger.Error(ctx).Err(err).Msg("Failed converting Benthos message to record in Write")
-		// Send the conversion error back through the results channel
-		// Use non-blocking send
+	// Convert each message back to a record
+	records := make([]opencdc.Record, 0, len(msgs))
+	var conversionErr error
+
+	for i, msg := range msgs {
+		record, err := w.p.fromMessage(ctx, msg)
+		if err != nil {
+			w.logger.Error(ctx).Err(err).Int("msg_index", i).Msg("Failed converting Benthos message to record in WriteBatch")
+			conversionErr = fmt.Errorf("failed converting message %d: %w", i, err)
+			break
+		}
+		records = append(records, record)
+	}
+
+	// If there was an error converting any message, send the error back
+	if conversionErr != nil {
 		select {
-		case w.p.results <- processResult{err: fmt.Errorf("failed converting Benthos message to record: %w", err)}:
+		case w.p.resultBatches <- batchProcessResult{err: conversionErr}:
 		default:
-			w.logger.Warn(ctx).Err(err).Msg("Result channel full or closed, dropping conversion error")
+			w.logger.Warn(ctx).Err(conversionErr).Msg("Result channel full or closed, dropping conversion error")
 		}
 		// Even though we sent the error back, we return nil to Benthos here
-		// because the *output* operation itself didn't fail (we successfully received the message).
-		// The error is related to *processing*, which is handled via the results channel and the input's AckFunc.
-		// Returning an error here might cause Benthos to retry unnecessarily.
+		// because the *output* operation itself didn't fail (we successfully received the messages).
 		return nil
 	}
 
-	w.logger.Trace(ctx).RawJSON("record_key", record.Key.Bytes()).Msg("Sending processed record from Benthos Write")
-	// Send the successfully processed record back
+	w.logger.Debug(ctx).Int("record_count", len(records)).Msg("Sending processed records from Benthos WriteBatch")
+	// Send the successfully processed records back
 	// Use non-blocking send
 	select {
-	case w.p.results <- processResult{record: record}:
+	case w.p.resultBatches <- batchProcessResult{records: records}:
 		return nil // Success
 	case <-ctx.Done():
-		w.logger.Warn(ctx).Msg("Context cancelled while sending result from Benthos Write")
+		w.logger.Warn(ctx).Msg("Context cancelled while sending results from Benthos WriteBatch")
 		return ctx.Err()
 	default:
 		// This case should ideally not happen if Process is waiting, but as a fallback:
-		w.logger.Error(ctx).Msg("Result channel full or closed when sending success from Benthos Write")
+		w.logger.Error(ctx).Msg("Result channel full or closed when sending success from Benthos WriteBatch")
 		// We can't easily signal this back, Benthos might consider it a success.
-		// This indicates a potential deadlock or issue in the processor logic.
-		return fmt.Errorf("failed to send processed record back: result channel blocked")
+		return fmt.Errorf("failed to send processed records back: result channel blocked")
 	}
 }
 
-func (w *conduitOutputWrapper) Close(ctx context.Context) error {
-	w.logger.Debug(ctx).Msg("Benthos output closing")
+func (w *conduitBatchOutputWrapper) Close(ctx context.Context) error {
+	w.logger.Debug(ctx).Msg("Benthos batch output closing")
 	// No specific closing needed
 	return nil
 }
@@ -604,17 +735,21 @@ func (w *conduitOutputWrapper) Close(ctx context.Context) error {
 
 // toMessage converts an opencdc.Record to a Benthos message.
 func (p *BenthosProcessor) toMessage(record opencdc.Record) *service.Message {
-	// TODO: Potential optimization: If the record payload is already JSON bytes,
-	// could we use msg.SetBytes(record.Payload.Bytes()) directly?
-	// Need to ensure Benthos processors handle raw bytes correctly or if they expect structured.
-	// For now, always convert to structured map for compatibility.
+	// Create a new message with nil content
 	msg := service.NewMessage(nil)
-	msg.SetStructured(record.Map()) // Convert record to map[string]any
+
+	// Convert record to structured map representation
+	recordMap := record.Map()
+
+	// Set the structured data on the message
+	msg.SetStructured(recordMap)
+
 	return msg
 }
 
 // fromMessage converts a Benthos message back to an opencdc.Record.
 func (p *BenthosProcessor) fromMessage(ctx context.Context, msg *service.Message) (opencdc.Record, error) {
+	// Get structured data from the message
 	structured, err := msg.AsStructured()
 	if err != nil {
 		// Attempt to handle raw bytes if AsStructured fails
@@ -643,6 +778,7 @@ func (p *BenthosProcessor) fromMessage(ctx context.Context, msg *service.Message
 				Int("bytes_length", len(msgBytes)).
 				Msg("Raw bytes are not JSON, creating simple record with raw payload")
 
+			// Create a new record directly
 			return opencdc.Record{
 				Payload: opencdc.Change{
 					After: opencdc.RawData(msgBytes),
@@ -662,8 +798,9 @@ func (p *BenthosProcessor) fromMessage(ctx context.Context, msg *service.Message
 		return opencdc.Record{}, fmt.Errorf("Benthos message structured data was not a map[string]interface{}, got type %T with value: %v", structured, structured)
 	}
 
-	// Create record and populate it from the map data
+	// Create a new record
 	record := opencdc.Record{}
+
 	// Unmap automatically handles converting map fields back to record fields
 	err = record.Unmap(structuredMap)
 	if err != nil {

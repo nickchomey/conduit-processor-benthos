@@ -9,17 +9,42 @@ import (
 
 const (
 	ProcessorConfigBenthosYAML = "benthosYAML"
+	ProcessorConfigBufferSize  = "bufferSize"
+	ProcessorConfigThreadCount = "threadCount"
+	ProcessorConfigLogLevel    = "logLevel"
 )
 
 func (ProcessorConfig) Parameters() map[string]config.Parameter {
 	return map[string]config.Parameter{
 		ProcessorConfigBenthosYAML: {
 			Default:     "",
-			Description: "BenthosYAML is the YAML configuration for the Benthos pipeline",
+			Description: "YAML configuration for the Benthos processors section",
 			Type:        config.ParameterTypeString,
 			Validations: []config.Validation{
 				config.ValidationRequired{},
 			},
+		},
+		ProcessorConfigBufferSize: {
+			Default:     "10",
+			Description: "Size of internal channels for processing records",
+			Type:        config.ParameterTypeInt,
+			Validations: []config.Validation{
+				config.ValidationGreaterThan{V: 0},
+			},
+		},
+		ProcessorConfigThreadCount: {
+			Default:     "1",
+			Description: "Number of parallel processing threads in the Benthos pipeline",
+			Type:        config.ParameterTypeInt,
+			Validations: []config.Validation{
+				config.ValidationGreaterThan{V: 0},
+			},
+		},
+		ProcessorConfigLogLevel: {
+			Default:     "INFO",
+			Description: "Controls the verbosity of Benthos internal logs",
+			Type:        config.ParameterTypeString,
+			Validations: []config.Validation{},
 		},
 	}
 }
