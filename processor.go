@@ -5,12 +5,13 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/conduitio/conduit-commons/config"
 	"github.com/conduitio/conduit-commons/opencdc"
 	sdk "github.com/conduitio/conduit-processor-sdk"
+	"github.com/conduitio/conduit/pkg/foundation/ctxutil"
 	"github.com/conduitio/conduit/pkg/foundation/log"
-	"github.com/google/uuid" // Import UUID package
 	_ "github.com/warpstreamlabs/bento/public/components/io"
 	_ "github.com/warpstreamlabs/bento/public/components/pure"
 	"github.com/warpstreamlabs/bento/public/service"
@@ -20,11 +21,23 @@ import (
 
 // --- Global Registry ---
 
+// Note: We use ctxutil.ProcessorIDFromContext to get the processor ID from the context
+
 // processorRegistry holds active BenthosProcessor instances keyed by a unique ID.
 var (
 	processorRegistry = make(map[string]*BenthosProcessor)
 	registryMutex     sync.RWMutex // Mutex to protect concurrent access to the registry
 )
+
+// GetProcessorByID returns a BenthosProcessor instance by its ID.
+// Returns the processor and a boolean indicating if it was found.
+func GetProcessorByID(id string) (*BenthosProcessor, bool) {
+	registryMutex.RLock()
+	defer registryMutex.RUnlock()
+
+	processor, ok := processorRegistry[id]
+	return processor, ok
+}
 
 // baseBenthosConfigYAML defines the static input/output structure for the Benthos stream.
 // The INSTANCE_ID placeholder will be replaced with the processor's unique ID.
@@ -145,9 +158,8 @@ type BenthosProcessor struct {
 	// but updates (updateBenthosStream, Teardown) need exclusive write lock.
 	mu sync.RWMutex
 
-	// Benthos components
+	// Benthos stream
 	benthosStream *service.Stream
-	cancelBenthos context.CancelFunc
 
 	// Unique ID for this processor instance
 	instanceID string
@@ -169,9 +181,9 @@ type ProcessorConfig struct {
 // NewBenthosProcessor creates a new Benthos processor with the provided logger.
 func NewBenthosProcessor(logger log.CtxLogger) *BenthosProcessor {
 	return &BenthosProcessor{
-		records: make(chan opencdc.Record), // Unbuffered might be okay if Benthos reads quickly
-		results: make(chan processResult),  // Unbuffered might be okay
-		errC:    make(chan error, 1),       // Buffered to avoid blocking the stream goroutine on error
+		records: make(chan opencdc.Record, 10), // Small buffer for better performance
+		results: make(chan processResult, 10),  // Small buffer for better performance
+		errC:    make(chan error, 1),           // Buffered to avoid blocking the stream goroutine on error
 		logger:  logger.WithComponent("processor.benthos"),
 	}
 }
@@ -201,8 +213,19 @@ func (p *BenthosProcessor) Configure(ctx context.Context, cfg config.Config) err
 func (p *BenthosProcessor) Open(ctx context.Context) error {
 	p.logger.Debug(ctx).Msg("Opening Benthos processor...")
 
-	// Generate unique ID for this instance
-	p.instanceID = uuid.NewString()
+	// Get the processor ID from the context
+	// The processor ID is set by Conduit and follows the format "pipelineID:processorID"
+	processorID := ctxutil.ProcessorIDFromContext(ctx)
+
+	if processorID != "" {
+		p.logger.Debug(ctx).Str("processorID", processorID).Msg("Found processor ID in context")
+		p.instanceID = processorID
+		p.logger.Info(ctx).Str("instance.id", p.instanceID).Msg("Using Conduit processor ID")
+	} else {
+		// If processor ID is not found in context, log a warning and fail
+		p.logger.Error(ctx).Msg("Processor ID not found in context - this is required for the Benthos processor")
+		return fmt.Errorf("processor ID not found in context - this is required for the Benthos processor")
+	}
 
 	// Register this instance in the global registry
 	registryMutex.Lock()
@@ -211,8 +234,8 @@ func (p *BenthosProcessor) Open(ctx context.Context) error {
 	p.logger.Debug(ctx).Str("instance.id", p.instanceID).Msg("Processor instance registered") // Log instance ID here
 
 	// Initial build and run of the Benthos stream using the configured processor YAML
-	// updateBenthosStream handles locking internally
-	err := p.updateBenthosStream(ctx, p.config.BenthosYAML)
+	// UpdateBenthosStream handles locking internally
+	err := p.UpdateBenthosStream(ctx, p.config.BenthosYAML)
 	if err != nil {
 		// Cleanup registry entry if initial build fails
 		registryMutex.Lock()
@@ -226,7 +249,7 @@ func (p *BenthosProcessor) Open(ctx context.Context) error {
 }
 
 // buildAndRunBenthosStream encapsulates the logic to build and start a Benthos stream.
-func (p *BenthosProcessor) buildAndRunBenthosStream(ctx context.Context, processorYAML string) (*service.Stream, context.CancelFunc, error) {
+func (p *BenthosProcessor) buildAndRunBenthosStream(ctx context.Context, processorYAML string) (*service.Stream, error) {
 	p.logger.Debug(ctx).Msg("Building new Benthos stream instance...")
 
 	builder := service.NewStreamBuilder()
@@ -238,14 +261,14 @@ func (p *BenthosProcessor) buildAndRunBenthosStream(ctx context.Context, process
 	// Set the base configuration (input/output wrappers)
 	err := builder.SetYAML(interpolatedBaseYAML)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed parsing base Benthos YAML config: %w", err)
+		return nil, fmt.Errorf("failed parsing base Benthos YAML config: %w", err)
 	}
 
 	// Add the processor-specific configuration
 	if strings.TrimSpace(processorYAML) != "" {
 		err = builder.AddProcessorYAML(processorYAML)
 		if err != nil {
-			return nil, nil, fmt.Errorf("failed parsing Benthos processor YAML config: %w", err)
+			return nil, fmt.Errorf("failed parsing Benthos processor YAML config: %w", err)
 		}
 	} else {
 		p.logger.Warn(ctx).Msg("No processor YAML provided, Benthos pipeline will have no processors.")
@@ -254,12 +277,12 @@ func (p *BenthosProcessor) buildAndRunBenthosStream(ctx context.Context, process
 	// Build the Benthos stream
 	stream, err := builder.Build()
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed building Benthos stream: %w", err)
+		return nil, fmt.Errorf("failed building Benthos stream: %w", err)
 	}
 
 	// Run the Benthos stream in a goroutine
 	// Use a background context so the stream's lifecycle isn't tied to this specific call context
-	benthosCtx, cancelBenthos := context.WithCancel(context.Background())
+	benthosCtx := context.Background()
 
 	// Clear any stale error before starting the new stream goroutine
 	select {
@@ -288,7 +311,7 @@ func (p *BenthosProcessor) buildAndRunBenthosStream(ctx context.Context, process
 	}()
 
 	p.logger.Debug(ctx).Msg("New Benthos stream instance built and running.")
-	return stream, cancelBenthos, nil
+	return stream, nil
 }
 
 // UpdateBenthosStream handles stopping the current stream (if running)
@@ -301,18 +324,39 @@ func (p *BenthosProcessor) UpdateBenthosStream(ctx context.Context, newProcessor
 	p.logger.Info(ctx).Msg("Updating Benthos stream configuration...")
 
 	// 1. Stop existing stream if it's running
-	if p.cancelBenthos != nil {
+	if p.benthosStream != nil {
 		p.logger.Debug(ctx).Msg("Stopping existing Benthos stream instance...")
-		p.cancelBenthos() // Signal the stream goroutine to stop
-		p.cancelBenthos = nil
+
+		// Store the old stream
+		oldStream := p.benthosStream
+
+		// Clear the processor state immediately to prevent any new records from being processed
 		p.benthosStream = nil
-		// Note: We don't explicitly wait for the goroutine to finish,
-		// cancellation should propagate. Starting the new stream is safe.
-		p.logger.Debug(ctx).Msg("Existing Benthos stream instance stop signal sent.")
+
+		// Clear any stale errors from the error channel
+		select {
+		case <-p.errC:
+		default:
+		}
+
+		// Stop the old stream gracefully with a timeout
+		stopCtx, stopCancel := context.WithTimeout(ctx, 5*time.Second)
+		defer stopCancel()
+
+		p.logger.Debug(ctx).Msg("Stopping Benthos stream gracefully...")
+		err := oldStream.Stop(stopCtx)
+		if err != nil {
+			p.logger.Warn(ctx).Err(err).Msg("Error stopping Benthos stream, proceeding anyway")
+		} else {
+			p.logger.Debug(ctx).Msg("Benthos stream stopped gracefully")
+		}
+
+		p.logger.Debug(ctx).Msg("Existing Benthos stream instance cleanup complete")
 	}
 
 	// 2. Build and run the new stream
-	stream, cancel, err := p.buildAndRunBenthosStream(ctx, newProcessorYAML)
+	p.logger.Debug(ctx).Msg("Building and running new Benthos stream...")
+	stream, err := p.buildAndRunBenthosStream(ctx, newProcessorYAML)
 	if err != nil {
 		p.logger.Error(ctx).Err(err).Msg("Failed to build and run new Benthos stream during update")
 		// Keep the processor in a non-running state, don't update config
@@ -321,16 +365,10 @@ func (p *BenthosProcessor) UpdateBenthosStream(ctx context.Context, newProcessor
 
 	// 3. Update processor state with the new stream and config
 	p.benthosStream = stream
-	p.cancelBenthos = cancel
 	p.config.BenthosYAML = newProcessorYAML // Store the currently active processor config
 
-	p.logger.Info(ctx).Msg("Benthos stream configuration updated successfully.")
+	p.logger.Info(ctx).Msg("Benthos stream configuration updated successfully")
 	return nil
-}
-
-// Alias for clarity in Open
-func (p *BenthosProcessor) updateBenthosStream(ctx context.Context, newProcessorYAML string) error {
-	return p.UpdateBenthosStream(ctx, newProcessorYAML)
 }
 
 func (p *BenthosProcessor) Process(ctx context.Context, records []opencdc.Record) []sdk.ProcessedRecord {
@@ -340,7 +378,7 @@ func (p *BenthosProcessor) Process(ctx context.Context, records []opencdc.Record
 	defer p.mu.RUnlock()
 
 	// Check if the stream is actually running (it might be during an update or failed to start)
-	if p.benthosStream == nil || p.cancelBenthos == nil {
+	if p.benthosStream == nil {
 		p.logger.Warn(ctx).Msg("Benthos stream is not running, skipping processing batch")
 		// Return errors for all records in the batch
 		out := make([]sdk.ProcessedRecord, len(records))
@@ -425,12 +463,21 @@ func (p *BenthosProcessor) Teardown(ctx context.Context) error {
 	defer p.mu.Unlock()
 
 	// Stop the Benthos stream if it's running
-	if p.cancelBenthos != nil {
-		p.logger.Debug(ctx).Msg("Stopping Benthos stream instance...")
-		p.cancelBenthos()
-		p.cancelBenthos = nil
+	if p.benthosStream != nil {
+		p.logger.Debug(ctx).Msg("Stopping Benthos stream instance gracefully...")
+
+		// Stop the stream gracefully with a timeout
+		stopCtx, stopCancel := context.WithTimeout(ctx, 5*time.Second)
+		defer stopCancel()
+
+		err := p.benthosStream.Stop(stopCtx)
+		if err != nil {
+			p.logger.Warn(ctx).Err(err).Msg("Error stopping Benthos stream during teardown")
+		} else {
+			p.logger.Debug(ctx).Msg("Benthos stream stopped gracefully during teardown")
+		}
+
 		p.benthosStream = nil
-		p.logger.Debug(ctx).Msg("Benthos stream instance stop signal sent.")
 	}
 
 	// Deregister this instance from the global registry
@@ -441,12 +488,6 @@ func (p *BenthosProcessor) Teardown(ctx context.Context) error {
 		p.logger.Debug(ctx).Msg("Processor instance deregistered")
 		p.instanceID = "" // Clear the ID
 	}
-
-	// Closing channels might cause panics if goroutines are still trying to use them.
-	// Relying on context cancellation and GC is generally safer.
-	// close(p.records)
-	// close(p.results)
-	// close(p.errC)
 
 	p.logger.Info(ctx).Msg("Benthos processor torn down.")
 	return nil
