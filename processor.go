@@ -2,6 +2,7 @@ package benthos
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"sync"
@@ -558,7 +559,7 @@ func (w *conduitOutputWrapper) Write(ctx context.Context, msg *service.Message) 
 	// It writes the result back to the specific processor instance's channel.
 	w.logger.Trace(ctx).Msg("Benthos output Write called")
 
-	record, err := w.p.fromMessage(msg) // Use helper from the processor instance
+	record, err := w.p.fromMessage(ctx, msg) // Use helper from the processor instance
 	if err != nil {
 		w.logger.Error(ctx).Err(err).Msg("Failed converting Benthos message to record in Write")
 		// Send the conversion error back through the results channel
@@ -613,30 +614,52 @@ func (p *BenthosProcessor) toMessage(record opencdc.Record) *service.Message {
 }
 
 // fromMessage converts a Benthos message back to an opencdc.Record.
-func (p *BenthosProcessor) fromMessage(msg *service.Message) (opencdc.Record, error) {
+func (p *BenthosProcessor) fromMessage(ctx context.Context, msg *service.Message) (opencdc.Record, error) {
 	structured, err := msg.AsStructured()
 	if err != nil {
 		// Attempt to handle raw bytes if AsStructured fails
-		// Fix: Correctly handle two return values from AsBytes
-		if msgBytes, err := msg.AsBytes(); err == nil && msgBytes != nil {
-			// This assumes the raw bytes represent the entire record structure,
-			// which might not be the case depending on Benthos processors.
-			// A common pattern might be processors modifying only payload.
-			// This fallback needs careful consideration based on expected Benthos usage.
-			p.logger.Warn(context.TODO()).Msg("Benthos message was not structured, attempting to treat raw bytes as record (experimental)")
-			// We need a way to reconstruct the record from bytes. OpenCDC doesn't have a direct
-			// method for this unless it's e.g., JSON bytes of the whole record map.
-			// For now, return an error as this path is unclear.
-			return opencdc.Record{}, fmt.Errorf("failed to get structured data and raw byte handling not fully implemented: %w", err)
+		p.logger.Debug(ctx).Err(err).Msg("Failed to get structured data from Benthos message, attempting to handle raw bytes")
 
+		msgBytes, bytesErr := msg.AsBytes()
+		if bytesErr != nil {
+			p.logger.Error(ctx).Err(bytesErr).Msg("Failed to get raw bytes from Benthos message")
+			return opencdc.Record{}, fmt.Errorf("failed to get data from Benthos message: could not get structured data (%w) or raw bytes (%v)", err, bytesErr)
 		}
-		return opencdc.Record{}, fmt.Errorf("failed to get structured data from Benthos message: %w", err)
+
+		if msgBytes == nil {
+			p.logger.Error(ctx).Msg("Benthos message contains neither structured data nor raw bytes")
+			return opencdc.Record{}, fmt.Errorf("failed to get data from Benthos message: message contains neither structured data nor raw bytes")
+		}
+
+		// Try to parse bytes as JSON (assuming it's a JSON representation of a record)
+		var structuredMap map[string]interface{}
+		if jsonErr := json.Unmarshal(msgBytes, &structuredMap); jsonErr == nil {
+			// If JSON parsing succeeded, use the structured map
+			p.logger.Debug(ctx).Msg("Successfully parsed raw bytes as JSON map")
+			structured = structuredMap
+		} else {
+			// If not JSON, create a simple record with the raw bytes as payload.after
+			p.logger.Debug(ctx).
+				Int("bytes_length", len(msgBytes)).
+				Msg("Raw bytes are not JSON, creating simple record with raw payload")
+
+			return opencdc.Record{
+				Payload: opencdc.Change{
+					After: opencdc.RawData(msgBytes),
+				},
+			}, nil
+		}
 	}
 
 	structuredMap, ok := structured.(map[string]interface{})
 	if !ok {
 		// This might happen if Benthos outputs a non-map structure (e.g., just a string or number)
-		return opencdc.Record{}, fmt.Errorf("Benthos message structured data was not a map[string]interface{}, got type %T", structured)
+		p.logger.Error(ctx).
+			Str("type", fmt.Sprintf("%T", structured)).
+			Str("value", fmt.Sprintf("%v", structured)).
+			Msg("Benthos message structured data was not a map[string]interface{}")
+
+		return opencdc.Record{}, fmt.Errorf("Benthos message structured data was not a map[string]interface{}, got type %T with value: %v", structured, structured)
 	}
 
 	// Create record and populate it from the map data
@@ -644,7 +667,20 @@ func (p *BenthosProcessor) fromMessage(msg *service.Message) (opencdc.Record, er
 	// Unmap automatically handles converting map fields back to record fields
 	err = record.Unmap(structuredMap)
 	if err != nil {
-		return opencdc.Record{}, fmt.Errorf("failed to convert Benthos structured map to opencdc.Record: %w", err)
+		// Include more details about the map in the error message
+		keys := make([]string, 0, len(structuredMap))
+		for k := range structuredMap {
+			keys = append(keys, k)
+		}
+
+		p.logger.Error(ctx).
+			Err(err).
+			Strs("map_keys", keys).
+			Msg("Failed to convert Benthos structured map to opencdc.Record")
+
+		return opencdc.Record{}, fmt.Errorf("failed to convert Benthos structured map to opencdc.Record: %w (map keys: %v)", err, keys)
 	}
+
+	p.logger.Debug(ctx).Msg("Successfully converted Benthos message to opencdc.Record")
 	return record, nil
 }
