@@ -10,6 +10,8 @@ import (
 
 	"github.com/conduitio/conduit-commons/config"
 	"github.com/conduitio/conduit-commons/opencdc"
+	"github.com/conduitio/conduit/pkg/foundation/cerrors"
+
 	sdk "github.com/conduitio/conduit-processor-sdk"
 	"github.com/conduitio/conduit/pkg/foundation/ctxutil"
 	"github.com/conduitio/conduit/pkg/foundation/log"
@@ -138,10 +140,10 @@ func init() {
 			// Get the instance ID from the config
 			instanceID, err := conf.FieldString("instance_id")
 			if err != nil {
-				return nil, fmt.Errorf("failed to get instance_id for conduit_processor_input: %w", err)
+				return nil, cerrors.Errorf("failed to get instance_id for conduit_processor_input: %w", err)
 			}
 			if instanceID == "" {
-				return nil, fmt.Errorf("instance_id is required for conduit_processor_input")
+				return nil, cerrors.New("instance_id is required for conduit_processor_input")
 			}
 
 			registryMutex.RLock()
@@ -149,7 +151,7 @@ func init() {
 			registryMutex.RUnlock()
 
 			if !ok {
-				return nil, fmt.Errorf("processor instance %q not found in registry", instanceID)
+				return nil, cerrors.Errorf("processor instance %q not found in registry", instanceID)
 			}
 
 			// Wrap with AutoRetryNacksBatched for automatic retry of failed batches
@@ -171,10 +173,10 @@ func init() {
 			// Get the instance ID from the config
 			instanceID, err := conf.FieldString("instance_id")
 			if err != nil {
-				return nil, service.BatchPolicy{}, 0, fmt.Errorf("failed to get instance_id for conduit_processor_output: %w", err)
+				return nil, service.BatchPolicy{}, 0, cerrors.Errorf("failed to get instance_id for conduit_processor_output: %w", err)
 			}
 			if instanceID == "" {
-				return nil, service.BatchPolicy{}, 0, fmt.Errorf("instance_id is required for conduit_processor_output")
+				return nil, service.BatchPolicy{}, 0, cerrors.New("instance_id is required for conduit_processor_output")
 			}
 
 			registryMutex.RLock()
@@ -182,7 +184,7 @@ func init() {
 			registryMutex.RUnlock()
 
 			if !ok {
-				return nil, service.BatchPolicy{}, 0, fmt.Errorf("processor instance %q not found in registry", instanceID)
+				return nil, service.BatchPolicy{}, 0, cerrors.Errorf("processor instance %q not found in registry", instanceID)
 			}
 
 			// Return the output wrapper with no batching policy (we handle batching ourselves)
@@ -249,7 +251,7 @@ func (p *BenthosProcessor) Configure(ctx context.Context, cfg config.Config) err
 	// Parse and store the processor-specific YAML provided by the user/Conduit config
 	err := sdk.ParseConfig(ctx, cfg, &p.config, BenthosConfig{}.Parameters())
 	if err != nil {
-		return fmt.Errorf("failed to parse configuration: %w", err)
+		return cerrors.Errorf("failed to parse configuration: %w", err)
 	}
 
 	// Validate configuration values
@@ -308,7 +310,7 @@ func (p *BenthosProcessor) Open(ctx context.Context) error {
 	} else {
 		// If processor ID is not found in context, log a warning and fail
 		p.logger.Error(ctx).Msg("Processor ID not found in context - this is required for the Benthos processor")
-		return fmt.Errorf("processor ID not found in context - this is required for the Benthos processor")
+		return cerrors.New("processor ID not found in context - this is required for the Benthos processor")
 	}
 
 	// Register this instance in the global registry
@@ -347,7 +349,7 @@ func (p *BenthosProcessor) Open(ctx context.Context) error {
 		registryMutex.Lock()
 		delete(processorRegistry, p.instanceID)
 		registryMutex.Unlock()
-		return fmt.Errorf("failed initial Benthos stream setup: %w", err)
+		return cerrors.Errorf("failed initial Benthos stream setup: %w", err)
 	}
 
 	p.logger.Info(ctx).Msg("Benthos processor opened successfully.")
@@ -393,7 +395,7 @@ func (p *BenthosProcessor) SetupBenthosStream(ctx context.Context, config Bentho
 			Str("instance_id", p.instanceID).
 			Str("complete_yaml", completeYAML).
 			Msg("Failed to parse Benthos YAML configuration")
-		return fmt.Errorf("failed parsing Benthos YAML config: %w", err)
+		return cerrors.Errorf("failed parsing Benthos YAML config: %w", err)
 	}
 
 	// Set thread count for the pipeline (special case as it's not part of the YAML)
@@ -408,7 +410,7 @@ func (p *BenthosProcessor) SetupBenthosStream(ctx context.Context, config Bentho
 	// Build and run the stream
 	stream, err := builder.Build()
 	if err != nil {
-		return fmt.Errorf("failed building Benthos stream: %w", err)
+		return cerrors.Errorf("failed building Benthos stream: %w", err)
 	}
 
 	// Run the stream in a background context
@@ -494,7 +496,7 @@ func (p *BenthosProcessor) Process(ctx context.Context, records []opencdc.Record
 		p.logger.Warn(ctx).Msg("Benthos stream is not running, skipping processing batch")
 		// Return errors for all records in the batch
 		out := make([]sdk.ProcessedRecord, len(records))
-		err := fmt.Errorf("Benthos stream not running (instance ID: %s)", p.instanceID)
+		err := cerrors.Errorf("Benthos stream not running (instance ID: %s)", p.instanceID)
 		for i := range records {
 			out[i] = sdk.ErrorRecord{Error: err}
 		}
@@ -519,7 +521,7 @@ func (p *BenthosProcessor) Process(ctx context.Context, records []opencdc.Record
 			p.logger.Error(ctx).Err(err).Int("start_index", i).Int("end_index", end-1).Msg("Failed processing batch through Benthos")
 			for j := range batchRecords {
 				out = append(out, sdk.ErrorRecord{
-					Error: fmt.Errorf("batch processing failed (index %d): %w", i+j, err),
+					Error: cerrors.Errorf("batch processing failed (index %d): %w", i+j, err),
 				})
 			}
 		} else {
@@ -548,7 +550,7 @@ func (p *BenthosProcessor) Process(ctx context.Context, records []opencdc.Record
 func (p *BenthosProcessor) processBatch(ctx context.Context, records []opencdc.Record) ([]opencdc.Record, error) {
 	// Double-check stream status under the lock, though the outer Process call should handle this.
 	if p.benthosStream == nil {
-		return nil, fmt.Errorf("Benthos stream is not running (instance ID: %s)", p.instanceID)
+		return nil, cerrors.Errorf("Benthos stream is not running (instance ID: %s)", p.instanceID)
 	}
 
 	// Send the batch to Benthos input channel
@@ -557,7 +559,7 @@ func (p *BenthosProcessor) processBatch(ctx context.Context, records []opencdc.R
 		p.logger.Debug(ctx).Int("batch_size", len(records)).Msg("Record batch sent to Benthos input channel")
 	case err := <-p.errC:
 		p.logger.Error(ctx).Err(err).Msg("Received Benthos stream error while trying to send batch")
-		return nil, fmt.Errorf("Benthos stream error: %w", err)
+		return nil, cerrors.Errorf("Benthos stream error: %w", err)
 	case <-ctx.Done():
 		p.logger.Warn(ctx).Msg("Context cancelled while trying to send batch to Benthos")
 		return nil, ctx.Err()
@@ -574,7 +576,7 @@ func (p *BenthosProcessor) processBatch(ctx context.Context, records []opencdc.R
 		return result.records, nil
 	case err := <-p.errC:
 		p.logger.Error(ctx).Err(err).Msg("Received Benthos stream error while waiting for batch result")
-		return nil, fmt.Errorf("Benthos stream error: %w", err)
+		return nil, cerrors.Errorf("Benthos stream error: %w", err)
 	case <-ctx.Done():
 		p.logger.Warn(ctx).Msg("Context cancelled while waiting for Benthos batch result")
 		return nil, ctx.Err()
@@ -653,7 +655,7 @@ func (w *conduitBenthosWrapper) Connect(ctx context.Context) error {
 func (w *conduitBenthosWrapper) ReadBatch(ctx context.Context) (service.MessageBatch, service.AckFunc, error) {
 	if w.role != "input" {
 		w.logger.Error(ctx).Msg("ReadBatch called on wrapper with incorrect role")
-		return nil, nil, fmt.Errorf("ReadBatch called on wrapper with role %s", w.role)
+		return nil, nil, cerrors.Errorf("ReadBatch called on wrapper with role %s", w.role)
 	}
 
 	// This ReadBatch method is called by the Benthos stream's input goroutine.
@@ -675,7 +677,7 @@ func (w *conduitBenthosWrapper) ReadBatch(ctx context.Context) (service.MessageB
 				// Send the error back to the processor's results channel
 				// Use non-blocking send
 				select {
-				case w.p.resultBatches <- batchProcessResult{err: fmt.Errorf("benthos batch processing failed: %w", err)}:
+				case w.p.resultBatches <- batchProcessResult{err: cerrors.Errorf("benthos batch processing failed: %w", err)}:
 				default:
 					w.logger.Warn(ctx).Err(err).Msg("Result channel full or closed, dropping Nack error")
 				}
@@ -690,7 +692,7 @@ func (w *conduitBenthosWrapper) ReadBatch(ctx context.Context) (service.MessageB
 	case err := <-w.p.errC: // Check for fatal stream errors
 		// Propagate the error to Benthos so it stops the input
 		w.logger.Error(ctx).Err(err).Msg("Benthos stream error during ReadBatch")
-		return nil, nil, fmt.Errorf("benthos stream error: %w", err)
+		return nil, nil, cerrors.Errorf("benthos stream error: %w", err)
 
 	case <-ctx.Done(): // Context cancelled (Benthos stream shutting down)
 		w.logger.Debug(ctx).Msg("Benthos input ReadBatch context cancelled")
@@ -703,7 +705,7 @@ func (w *conduitBenthosWrapper) ReadBatch(ctx context.Context) (service.MessageB
 func (w *conduitBenthosWrapper) WriteBatch(ctx context.Context, msgs service.MessageBatch) error {
 	if w.role != "output" {
 		w.logger.Error(ctx).Msg("WriteBatch called on wrapper with incorrect role")
-		return fmt.Errorf("WriteBatch called on wrapper with role %s", w.role)
+		return cerrors.Errorf("WriteBatch called on wrapper with role %s", w.role)
 	}
 
 	// This WriteBatch method is called by Benthos after processing is complete.
@@ -718,7 +720,7 @@ func (w *conduitBenthosWrapper) WriteBatch(ctx context.Context, msgs service.Mes
 		record, err := w.p.fromMessage(ctx, msg)
 		if err != nil {
 			w.logger.Error(ctx).Err(err).Int("msg_index", i).Msg("Failed converting Benthos message to record in WriteBatch")
-			conversionErr = fmt.Errorf("failed converting message %d: %w", i, err)
+			conversionErr = cerrors.Errorf("failed converting message %d: %w", i, err)
 			break
 		}
 		records = append(records, record)
@@ -749,7 +751,7 @@ func (w *conduitBenthosWrapper) WriteBatch(ctx context.Context, msgs service.Mes
 		// This case should ideally not happen if Process is waiting, but as a fallback:
 		w.logger.Error(ctx).Msg("Result channel full or closed when sending success from Benthos WriteBatch")
 		// We can't easily signal this back, Benthos might consider it a success.
-		return fmt.Errorf("failed to send processed records back: result channel blocked")
+		return cerrors.Errorf("failed to send processed records back: result channel blocked")
 	}
 }
 
