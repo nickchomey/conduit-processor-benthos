@@ -18,138 +18,46 @@ import (
 	"github.com/warpstreamlabs/bento/public/service"
 )
 
-//go:generate paramgen -output=paramgen_proc.go ProcessorConfig
-
-// --- Global Registry ---
-
-// Note: We use ctxutil.ProcessorIDFromContext to get the processor ID from the context
-
-// processorRegistry holds active BenthosProcessor instances keyed by a unique ID.
-var (
-	processorRegistry = make(map[string]*BenthosProcessor)
-	registryMutex     sync.RWMutex // Mutex to protect concurrent access to the registry
-)
-
-// GetProcessorByID returns a BenthosProcessor instance by its ID.
-// Returns the processor and a boolean indicating if it was found.
-func GetProcessorByID(id string) (*BenthosProcessor, bool) {
-	registryMutex.RLock()
-	defer registryMutex.RUnlock()
-
-	processor, ok := processorRegistry[id]
-	return processor, ok
-}
-
-// baseBenthosConfigYAML defines the static input/output structure for the Benthos stream.
-// The INSTANCE_ID placeholder will be replaced with the processor's unique ID.
-const baseBenthosConfigYAML = `
-input:
-  conduit_processor_input:
-    instance_id: ${INSTANCE_ID}
-output:
-  conduit_processor_output:
-    instance_id: ${INSTANCE_ID}
-# pipeline: processors will be added dynamically
-`
+//go:generate paramgen -output=paramgen_proc.go BenthosConfig
 
 // --- Benthos Component Wrappers and Registration ---
 
-// conduitInputConfig is the config structure for our custom Benthos input.
-type conduitInputConfig struct {
-	InstanceID string `json:"instance_id"`
-}
-
-// conduitOutputConfig is the config structure for our custom Benthos output.
-type conduitOutputConfig struct {
-	InstanceID string `json:"instance_id"`
-}
-
-// conduitBatchInputWrapper implements service.BatchInput, reading from a specific processor's channel.
-type conduitBatchInputWrapper struct {
+// conduitBenthosWrapper implements both service.BatchInput and service.BatchOutput interfaces.
+// It acts as a bridge between Benthos and the Conduit processor.
+type conduitBenthosWrapper struct {
 	p      *BenthosProcessor
 	logger log.CtxLogger
+	role   string // "input" or "output"
 }
 
-// conduitBatchOutputWrapper implements service.BatchOutput, writing to a specific processor's channel.
-type conduitBatchOutputWrapper struct {
-	p      *BenthosProcessor
-	logger log.CtxLogger
+// BenthosConfig represents the configuration for the Benthos processor
+// It's used both for initial configuration and for updates
+type BenthosConfig struct {
+	// YAML is the complete Benthos configuration (excluding input/output)
+	// This includes processors, resources, buffer, metrics, etc.
+	YAML string `json:"yaml" validate:"required"`
+
+	// BatchSize controls the maximum number of records to process in a single Benthos batch
+	// Higher values can improve throughput but may increase memory usage
+	BatchSize int `json:"batchSize" default:"100" validate:"gt=0"`
+
+	// ChannelBufferSize controls the size of internal channels for communication
+	// Higher values can improve throughput but use more memory
+	ChannelBufferSize int `json:"channelBufferSize" default:"10"`
+
+	// ThreadCount controls the number of parallel processing threads in the Benthos pipeline
+	// Higher values can improve throughput for CPU-bound processors
+	ThreadCount int `json:"threadCount" default:"1"`
 }
 
-// Ensure Benthos input/output plugins are registered only once globally
-func init() {
-	inputConfSpec := service.NewConfigSpec().
-		Field(service.NewStringField("instance_id").Description("The unique ID of the processor instance."))
-
-	err := service.RegisterBatchInput(
-		"conduit_processor_input",
-		inputConfSpec,
-		func(conf *service.ParsedConfig, mgr *service.Resources) (service.BatchInput, error) {
-			// Get the instance ID from the config
-			instanceID, err := conf.FieldString("instance_id")
-			if err != nil {
-				return nil, fmt.Errorf("failed to get instance_id for conduit_processor_input: %w", err)
-			}
-			if instanceID == "" {
-				return nil, fmt.Errorf("instance_id is required for conduit_processor_input")
-			}
-
-			registryMutex.RLock()
-			p, ok := processorRegistry[instanceID]
-			registryMutex.RUnlock()
-
-			if !ok {
-				return nil, fmt.Errorf("processor instance %q not found in registry", instanceID)
-			}
-
-			// Wrap with AutoRetryNacksBatched for automatic retry of failed batches
-			return service.AutoRetryNacksBatched(&conduitBatchInputWrapper{p: p, logger: p.logger.WithComponent("benthos.input")}), nil
-		},
-	)
-	if err != nil {
-		panic(fmt.Sprintf("failed registering Benthos batch input 'conduit_processor_input': %v", err))
-	}
-
-	outputConfSpec := service.NewConfigSpec().
-		Field(service.NewStringField("instance_id").Description("The unique ID of the processor instance."))
-
-	err = service.RegisterBatchOutput(
-		"conduit_processor_output",
-		outputConfSpec,
-		func(conf *service.ParsedConfig, mgr *service.Resources) (out service.BatchOutput, batchPolicy service.BatchPolicy, maxInFlight int, err error) {
-			// Get the instance ID from the config
-			instanceID, err := conf.FieldString("instance_id")
-			if err != nil {
-				return nil, service.BatchPolicy{}, 0, fmt.Errorf("failed to get instance_id for conduit_processor_output: %w", err)
-			}
-			if instanceID == "" {
-				return nil, service.BatchPolicy{}, 0, fmt.Errorf("instance_id is required for conduit_processor_output")
-			}
-
-			registryMutex.RLock()
-			p, ok := processorRegistry[instanceID]
-			registryMutex.RUnlock()
-
-			if !ok {
-				return nil, service.BatchPolicy{}, 0, fmt.Errorf("processor instance %q not found in registry", instanceID)
-			}
-
-			// Return the output wrapper with no batching policy (we handle batching ourselves)
-			// and a max in-flight of 1 (we process one batch at a time)
-			return &conduitBatchOutputWrapper{p: p, logger: p.logger.WithComponent("benthos.output")}, service.BatchPolicy{}, 1, nil
-		},
-	)
-	if err != nil {
-		panic(fmt.Sprintf("failed registering Benthos batch output 'conduit_processor_output': %v", err))
-	}
+type batchProcessResult struct {
+	records []opencdc.Record
+	err     error
 }
-
-// --- BenthosProcessor Struct ---
-
 type BenthosProcessor struct {
 	sdk.UnimplementedProcessor
 
-	config ProcessorConfig
+	config BenthosConfig
 
 	// channels for communication with Benthos
 	recordBatches chan []opencdc.Record
@@ -171,30 +79,124 @@ type BenthosProcessor struct {
 	logger log.CtxLogger
 }
 
-type batchProcessResult struct {
-	records []opencdc.Record
-	err     error
+// --- Global Registry ---
+
+// The processorRegistry is a global lookup table that maps processor IDs to processor instances.
+// It serves two main purposes:
+// 1. It allows Benthos input/output components to find the processor instance by ID
+// 2. It allows external API calls (like UpdateBenthosStream) to find the processor to update its configuration
+//
+// Lifecycle:
+// - Processors are registered in the Open method
+// - Processors are deregistered in the Teardown method
+//
+// Note: We use ctxutil.ProcessorIDFromContext to get the processor ID from the context
+
+var (
+	processorRegistry = make(map[string]*BenthosProcessor)
+	registryMutex     sync.RWMutex // Mutex to protect concurrent access to the registry
+)
+
+// baseBenthosConfigYAML defines the static input/output structure for the Benthos stream.
+// The INSTANCE_ID placeholder will be replaced with the processor's unique ID.
+const baseBenthosConfigYAML = `
+input:
+  conduit_processor_input:
+    instance_id: ${INSTANCE_ID}
+output:
+  conduit_processor_output:
+    instance_id: ${INSTANCE_ID}
+# pipeline: processors will be added dynamically
+`
+
+// GetProcessorByID returns a BenthosProcessor instance by its ID.
+// Returns the processor and a boolean indicating if it was found.
+//
+// This function is used by external API calls (like UpdateBenthosStream) to find
+// a processor instance by its ID so that its configuration can be updated.
+//
+// The processor ID typically follows the format "pipelineID:processorID" and is
+// set by Conduit when the processor is opened.
+func GetProcessorByID(id string) (*BenthosProcessor, bool) {
+	registryMutex.RLock()
+	defer registryMutex.RUnlock()
+
+	processor, ok := processorRegistry[id]
+	return processor, ok
 }
 
-type ProcessorConfig struct {
-	// BenthosYAML is the YAML configuration for the Benthos *processors* section
-	BenthosYAML string `json:"benthosYAML" validate:"required"`
+// Ensure Benthos input/output plugins are registered only once globally
+func init() {
+	// Create a shared config spec for both input and output components
+	componentConfSpec := service.NewConfigSpec().
+		Field(service.NewStringField("instance_id").Description("The unique ID of the processor instance."))
 
-	// BatchSize controls the maximum number of records to process in a single Benthos batch
-	// Higher values can improve throughput but may increase memory usage
-	BatchSize int `json:"batchSize" default:"100" validate:"gt=0"`
+	err := service.RegisterBatchInput(
+		"conduit_processor_input",
+		componentConfSpec,
+		func(conf *service.ParsedConfig, mgr *service.Resources) (service.BatchInput, error) {
+			// Get the instance ID from the config
+			instanceID, err := conf.FieldString("instance_id")
+			if err != nil {
+				return nil, fmt.Errorf("failed to get instance_id for conduit_processor_input: %w", err)
+			}
+			if instanceID == "" {
+				return nil, fmt.Errorf("instance_id is required for conduit_processor_input")
+			}
 
-	// ChannelBufferSize controls the size of internal channels for communication
-	// Higher values can improve throughput but use more memory
-	ChannelBufferSize int `json:"channelBufferSize" default:"10"`
+			registryMutex.RLock()
+			p, ok := processorRegistry[instanceID]
+			registryMutex.RUnlock()
 
-	// ThreadCount controls the number of parallel processing threads in the Benthos pipeline
-	// Higher values can improve throughput for CPU-bound processors
-	ThreadCount int `json:"threadCount" default:"1"`
+			if !ok {
+				return nil, fmt.Errorf("processor instance %q not found in registry", instanceID)
+			}
 
-	// LogLevel controls the verbosity of Benthos internal logs
-	// Valid values: NONE, ERROR, WARN, INFO, DEBUG, TRACE
-	LogLevel string `json:"logLevel" default:"INFO" validate:"oneof=NONE ERROR WARN INFO DEBUG TRACE"`
+			// Wrap with AutoRetryNacksBatched for automatic retry of failed batches
+			return service.AutoRetryNacksBatched(&conduitBenthosWrapper{
+				p:      p,
+				logger: p.logger.WithComponent("benthos.input"),
+				role:   "input",
+			}), nil
+		},
+	)
+	if err != nil {
+		panic(fmt.Sprintf("failed registering Benthos batch input 'conduit_processor_input': %v", err))
+	}
+
+	err = service.RegisterBatchOutput(
+		"conduit_processor_output",
+		componentConfSpec,
+		func(conf *service.ParsedConfig, mgr *service.Resources) (out service.BatchOutput, batchPolicy service.BatchPolicy, maxInFlight int, err error) {
+			// Get the instance ID from the config
+			instanceID, err := conf.FieldString("instance_id")
+			if err != nil {
+				return nil, service.BatchPolicy{}, 0, fmt.Errorf("failed to get instance_id for conduit_processor_output: %w", err)
+			}
+			if instanceID == "" {
+				return nil, service.BatchPolicy{}, 0, fmt.Errorf("instance_id is required for conduit_processor_output")
+			}
+
+			registryMutex.RLock()
+			p, ok := processorRegistry[instanceID]
+			registryMutex.RUnlock()
+
+			if !ok {
+				return nil, service.BatchPolicy{}, 0, fmt.Errorf("processor instance %q not found in registry", instanceID)
+			}
+
+			// Return the output wrapper with no batching policy (we handle batching ourselves)
+			// and a max in-flight of 1 (we process one batch at a time)
+			return &conduitBenthosWrapper{
+				p:      p,
+				logger: p.logger.WithComponent("benthos.output"),
+				role:   "output",
+			}, service.BatchPolicy{}, 1, nil
+		},
+	)
+	if err != nil {
+		panic(fmt.Sprintf("failed registering Benthos batch output 'conduit_processor_output': %v", err))
+	}
 }
 
 // NewBenthosProcessor creates a new Benthos processor with the provided logger.
@@ -207,11 +209,11 @@ func NewBenthosProcessor(logger log.CtxLogger) *BenthosProcessor {
 		// All channels will be initialized in Configure
 		logger: logger.WithComponent("processor.benthos"),
 		// Default config values - will be overridden in Configure
-		config: ProcessorConfig{
+		config: BenthosConfig{
+			YAML:              "logger:\n  level: INFO",
 			BatchSize:         defaultBatchSize,
 			ChannelBufferSize: defaultChannelBufferSize,
 			ThreadCount:       1,
-			LogLevel:          "INFO",
 		},
 	}
 }
@@ -224,7 +226,7 @@ func (p *BenthosProcessor) Specification() (sdk.Specification, error) {
 		Version:     "v0.1.0",
 		Author:      "Conduit",
 		Description: benthosProcessorDescription(),
-		Parameters:  ProcessorConfig{}.Parameters(),
+		Parameters:  BenthosConfig{}.Parameters(),
 	}
 
 	// Add examples in the description since sdk.Specification doesn't have an Examples field
@@ -245,7 +247,7 @@ func (p *BenthosProcessor) Configure(ctx context.Context, cfg config.Config) err
 	p.logger.Debug(ctx).Msg("Configuring Benthos processor...")
 
 	// Parse and store the processor-specific YAML provided by the user/Conduit config
-	err := sdk.ParseConfig(ctx, cfg, &p.config, ProcessorConfig{}.Parameters())
+	err := sdk.ParseConfig(ctx, cfg, &p.config, BenthosConfig{}.Parameters())
 	if err != nil {
 		return fmt.Errorf("failed to parse configuration: %w", err)
 	}
@@ -266,37 +268,27 @@ func (p *BenthosProcessor) Configure(ctx context.Context, cfg config.Config) err
 		p.config.ThreadCount = 1
 	}
 
-	// Validate log level
-	validLogLevels := map[string]bool{
-		"NONE":  true,
-		"ERROR": true,
-		"WARN":  true,
-		"INFO":  true,
-		"DEBUG": true,
-		"TRACE": true,
+	// Ensure we have at least a basic logger configuration in the YAML
+	if !strings.Contains(p.config.YAML, "logger:") {
+		// Add a default logger configuration if none exists
+		p.config.YAML = p.config.YAML + "\nlogger:\n  level: INFO"
 	}
-	if !validLogLevels[p.config.LogLevel] {
-		p.logger.Warn(ctx).Str("log_level", p.config.LogLevel).Msg("Invalid log level, using default value of INFO")
-		p.config.LogLevel = "INFO"
-	}
-
-	// No additional validation needed
 
 	// Initialize channels with the configured buffer size
 	// This is safe during Configure as the processor isn't running yet
 	p.recordBatches = make(chan []opencdc.Record, p.config.ChannelBufferSize)
 	p.resultBatches = make(chan batchProcessResult, p.config.ChannelBufferSize)
+	p.errC = make(chan error, 1) // Buffer of 1 for error channel
 
 	p.logger.Debug(ctx).
 		Int("channel_buffer_size", p.config.ChannelBufferSize).
 		Msg("Initialized channels with configured buffer size")
 
 	p.logger.Info(ctx).
-		Str("benthosYAML", p.config.BenthosYAML).
+		Str("yaml", p.config.YAML).
 		Int("batchSize", p.config.BatchSize).
 		Int("channelBufferSize", p.config.ChannelBufferSize).
 		Int("threadCount", p.config.ThreadCount).
-		Str("logLevel", p.config.LogLevel).
 		Msg("Benthos processor configured")
 
 	return nil
@@ -321,13 +313,35 @@ func (p *BenthosProcessor) Open(ctx context.Context) error {
 
 	// Register this instance in the global registry
 	registryMutex.Lock()
+	// Check if a processor with this ID already exists
+	if _, exists := processorRegistry[p.instanceID]; exists {
+		registryMutex.Unlock()
+		p.logger.Warn(ctx).
+			Str("instance.id", p.instanceID).
+			Msg("A processor with this ID is already registered - this may indicate a duplicate processor ID")
+		// We don't return an error here because the existing processor might be stale
+		// Instead, we'll overwrite it and log a warning
+	}
+
+	// Register the processor
 	processorRegistry[p.instanceID] = p
+	registryCount := len(processorRegistry)
 	registryMutex.Unlock()
-	p.logger.Debug(ctx).Str("instance.id", p.instanceID).Msg("Processor instance registered") // Log instance ID here
+
+	p.logger.Info(ctx).
+		Str("instance.id", p.instanceID).
+		Int("registry_count", registryCount).
+		Msg("Processor instance registered in global registry")
+
+	// Create a configuration for updating the Benthos stream
+	config := BenthosConfig{
+		YAML:        p.config.YAML,
+		ThreadCount: p.config.ThreadCount,
+	}
 
 	// Initial build and run of the Benthos stream using the configured processor YAML
-	// UpdateBenthosStream handles locking internally
-	err := p.UpdateBenthosStream(ctx, p.config.BenthosYAML)
+	// SetupBenthosStream handles locking internally
+	err := p.SetupBenthosStream(ctx, config)
 	if err != nil {
 		// Cleanup registry entry if initial build fails
 		registryMutex.Lock()
@@ -340,69 +354,71 @@ func (p *BenthosProcessor) Open(ctx context.Context) error {
 	return nil
 }
 
-// buildAndRunBenthosStream encapsulates the logic to build and start a Benthos stream.
-func (p *BenthosProcessor) buildAndRunBenthosStream(ctx context.Context, processorYAML string) (*service.Stream, error) {
-	p.logger.Debug(ctx).Msg("Building new Benthos stream instance...")
+// SetupBenthosStream handles creating or updating the Benthos stream with the provided configuration.
+// This method is thread-safe and can be called both during initialization and for runtime updates.
+func (p *BenthosProcessor) SetupBenthosStream(ctx context.Context, config BenthosConfig) error {
+	p.mu.Lock() // Acquire exclusive lock for update
+	defer p.mu.Unlock()
 
+	p.logger.Info(ctx).Msg("Setting up Benthos stream...")
+
+	// 1. Stop existing stream if it's running
+	if err := p.stopExistingStream(ctx); err != nil {
+		return err
+	}
+
+	// 2. Build and run the new stream with the provided configuration
 	builder := service.NewStreamBuilder()
 	builder.DisableLinting() // Disable linting as we construct programmatically
-
-	// Set logging level based on configuration
-	loggerYAML := fmt.Sprintf("level: %s", p.config.LogLevel)
-	err := builder.SetLoggerYAML(loggerYAML)
-	if err != nil {
-		p.logger.Warn(ctx).Err(err).Str("loggerYAML", loggerYAML).Msg("Failed to set Benthos logger level, using default")
-	}
-
-	// Set thread count for the pipeline
-	if p.config.ThreadCount > 1 {
-		// There's no direct SetPipelineYAML method, so we'll modify the threads directly
-		builder.SetThreads(p.config.ThreadCount)
-		p.logger.Debug(ctx).Int("threadCount", p.config.ThreadCount).Msg("Set Benthos thread count")
-	}
 
 	// Interpolate instance ID into the base config
 	interpolatedBaseYAML := strings.ReplaceAll(baseBenthosConfigYAML, "${INSTANCE_ID}", p.instanceID)
 
-	// Set the base configuration (input/output wrappers)
-	err = builder.SetYAML(interpolatedBaseYAML)
-	if err != nil {
-		return nil, fmt.Errorf("failed parsing base Benthos YAML config: %w", err)
+	// Combine the base YAML (input/output) with the user's YAML
+	completeYAML := interpolatedBaseYAML
+	if config.YAML != "" {
+		completeYAML = completeYAML + "\n" + config.YAML
 	}
 
-	// Add the processor-specific configuration
-	if strings.TrimSpace(processorYAML) != "" {
-		err = builder.AddProcessorYAML(processorYAML)
-		if err != nil {
-			return nil, fmt.Errorf("failed parsing Benthos processor YAML config: %w", err)
-		}
-	} else {
-		p.logger.Warn(ctx).Msg("No processor YAML provided, Benthos pipeline will have no processors.")
+	// Log the complete YAML configuration for debugging
+	p.logger.Debug(ctx).
+		Str("instance_id", p.instanceID).
+		Str("complete_yaml", completeYAML).
+		Msg("Setting Benthos YAML configuration")
+
+	// Set the complete configuration
+	if err := builder.SetYAML(completeYAML); err != nil {
+		p.logger.Error(ctx).
+			Err(err).
+			Str("instance_id", p.instanceID).
+			Str("complete_yaml", completeYAML).
+			Msg("Failed to parse Benthos YAML configuration")
+		return fmt.Errorf("failed parsing Benthos YAML config: %w", err)
 	}
 
-	// Build the Benthos stream
+	// Set thread count for the pipeline (special case as it's not part of the YAML)
+	threadCount := p.config.ThreadCount
+	if config.ThreadCount > 0 {
+		threadCount = config.ThreadCount
+	}
+	if threadCount > 1 {
+		builder.SetThreads(threadCount)
+	}
+
+	// Build and run the stream
 	stream, err := builder.Build()
 	if err != nil {
-		return nil, fmt.Errorf("failed building Benthos stream: %w", err)
+		return fmt.Errorf("failed building Benthos stream: %w", err)
 	}
 
-	// Run the Benthos stream in a goroutine
-	// Use a background context so the stream's lifecycle isn't tied to this specific call context
+	// Run the stream in a background context
 	benthosCtx := context.Background()
-
-	// Clear any stale error before starting the new stream goroutine
-	select {
-	case <-p.errC:
-	default:
-	}
-
 	go func() {
-		instanceLogger := p.logger.WithComponent("benthos.stream") // Logger for the stream goroutine
+		instanceLogger := p.logger.WithComponent("benthos.stream")
 		instanceLogger.Info(benthosCtx).Msg("Running Benthos stream instance...")
-		streamErr := stream.Run(benthosCtx) // This blocks until the stream stops
+		streamErr := stream.Run(benthosCtx)
 		if streamErr != nil && streamErr != context.Canceled {
 			instanceLogger.Error(benthosCtx).Err(streamErr).Msg("Benthos stream instance exited with error")
-			// Use non-blocking send to avoid deadlocking if the processor is already torn down
 			select {
 			case p.errC <- streamErr:
 			default:
@@ -411,25 +427,30 @@ func (p *BenthosProcessor) buildAndRunBenthosStream(ctx context.Context, process
 		} else if streamErr == context.Canceled {
 			instanceLogger.Info(benthosCtx).Msg("Benthos stream instance shut down gracefully.")
 		} else {
-			// Should only happen if input closes gracefully AND stream isn't cancelled
 			instanceLogger.Info(benthosCtx).Msg("Benthos stream instance finished.")
 		}
 	}()
 
-	p.logger.Debug(ctx).Msg("New Benthos stream instance built and running.")
-	return stream, nil
+	// Update processor state with the new stream
+	p.benthosStream = stream
+
+	// Store the YAML configuration for future reference
+	if config.YAML != "" {
+		p.config.YAML = config.YAML
+	}
+
+	// Update thread count if provided
+	if config.ThreadCount > 0 {
+		p.config.ThreadCount = config.ThreadCount
+	}
+
+	p.logger.Info(ctx).Msg("Benthos stream setup completed successfully")
+	return nil
 }
 
-// UpdateBenthosStream handles stopping the current stream (if running)
-// and starting a new one with the provided processor YAML configuration.
-// This method is thread-safe and intended to be called externally.
-func (p *BenthosProcessor) UpdateBenthosStream(ctx context.Context, newProcessorYAML string) error {
-	p.mu.Lock() // Acquire exclusive lock for update
-	defer p.mu.Unlock()
-
-	p.logger.Info(ctx).Msg("Updating Benthos stream configuration...")
-
-	// 1. Stop existing stream if it's running
+// stopExistingStream is a helper method to stop the current stream if it's running.
+// It assumes the caller holds the mutex lock.
+func (p *BenthosProcessor) stopExistingStream(ctx context.Context) error {
 	if p.benthosStream != nil {
 		p.logger.Debug(ctx).Msg("Stopping existing Benthos stream instance...")
 
@@ -459,21 +480,6 @@ func (p *BenthosProcessor) UpdateBenthosStream(ctx context.Context, newProcessor
 
 		p.logger.Debug(ctx).Msg("Existing Benthos stream instance cleanup complete")
 	}
-
-	// 2. Build and run the new stream
-	p.logger.Debug(ctx).Msg("Building and running new Benthos stream...")
-	stream, err := p.buildAndRunBenthosStream(ctx, newProcessorYAML)
-	if err != nil {
-		p.logger.Error(ctx).Err(err).Msg("Failed to build and run new Benthos stream during update")
-		// Keep the processor in a non-running state, don't update config
-		return err
-	}
-
-	// 3. Update processor state with the new stream and config
-	p.benthosStream = stream
-	p.config.BenthosYAML = newProcessorYAML // Store the currently active processor config
-
-	p.logger.Info(ctx).Msg("Benthos stream configuration updated successfully")
 	return nil
 }
 
@@ -602,25 +608,54 @@ func (p *BenthosProcessor) Teardown(ctx context.Context) error {
 	// Deregister this instance from the global registry
 	if p.instanceID != "" {
 		registryMutex.Lock()
-		delete(processorRegistry, p.instanceID)
+
+		// Check if this processor is still in the registry
+		// It's possible another processor with the same ID has replaced it
+		if existing, exists := processorRegistry[p.instanceID]; exists {
+			// Only delete if it's the same processor instance
+			if existing == p {
+				delete(processorRegistry, p.instanceID)
+				registryCount := len(processorRegistry)
+				p.logger.Info(ctx).
+					Str("instance.id", p.instanceID).
+					Int("registry_count", registryCount).
+					Msg("Processor instance deregistered from global registry")
+			} else {
+				p.logger.Warn(ctx).
+					Str("instance.id", p.instanceID).
+					Msg("Not deregistering processor - a different processor with the same ID is now in the registry")
+			}
+		} else {
+			p.logger.Warn(ctx).
+				Str("instance.id", p.instanceID).
+				Msg("Processor instance not found in registry during deregistration")
+		}
+
 		registryMutex.Unlock()
-		p.logger.Debug(ctx).Msg("Processor instance deregistered")
-		p.instanceID = "" // Clear the ID
+		p.instanceID = "" // Clear the ID regardless
 	}
 
 	p.logger.Info(ctx).Msg("Benthos processor torn down.")
 	return nil
 }
 
-// --- Benthos service.BatchInput Implementation (via wrapper) ---
+// --- Benthos service.BatchInput and service.BatchOutput Implementation (via wrapper) ---
 
-func (w *conduitBatchInputWrapper) Connect(ctx context.Context) error {
-	w.logger.Debug(ctx).Msg("Benthos batch input connected")
+// Connect implements both service.BatchInput.Connect and service.BatchOutput.Connect
+func (w *conduitBenthosWrapper) Connect(ctx context.Context) error {
+	w.logger.Debug(ctx).Str("role", w.role).Msg("Benthos component connected")
 	// No specific connection needed as we use channels
 	return nil
 }
 
-func (w *conduitBatchInputWrapper) ReadBatch(ctx context.Context) (service.MessageBatch, service.AckFunc, error) {
+// ReadBatch implements service.BatchInput.ReadBatch
+// This is only called when the wrapper is used as an input
+func (w *conduitBenthosWrapper) ReadBatch(ctx context.Context) (service.MessageBatch, service.AckFunc, error) {
+	if w.role != "input" {
+		w.logger.Error(ctx).Msg("ReadBatch called on wrapper with incorrect role")
+		return nil, nil, fmt.Errorf("ReadBatch called on wrapper with role %s", w.role)
+	}
+
 	// This ReadBatch method is called by the Benthos stream's input goroutine.
 	// It reads from the specific processor instance's channel.
 	select {
@@ -663,21 +698,14 @@ func (w *conduitBatchInputWrapper) ReadBatch(ctx context.Context) (service.Messa
 	}
 }
 
-func (w *conduitBatchInputWrapper) Close(ctx context.Context) error {
-	w.logger.Debug(ctx).Msg("Benthos batch input closing")
-	// No specific closing needed for channels from the input side
-	return nil
-}
+// WriteBatch implements service.BatchOutput.WriteBatch
+// This is only called when the wrapper is used as an output
+func (w *conduitBenthosWrapper) WriteBatch(ctx context.Context, msgs service.MessageBatch) error {
+	if w.role != "output" {
+		w.logger.Error(ctx).Msg("WriteBatch called on wrapper with incorrect role")
+		return fmt.Errorf("WriteBatch called on wrapper with role %s", w.role)
+	}
 
-// --- Benthos service.BatchOutput Implementation (via wrapper) ---
-
-func (w *conduitBatchOutputWrapper) Connect(ctx context.Context) error {
-	w.logger.Debug(ctx).Msg("Benthos batch output connected")
-	// No specific connection needed
-	return nil
-}
-
-func (w *conduitBatchOutputWrapper) WriteBatch(ctx context.Context, msgs service.MessageBatch) error {
 	// This WriteBatch method is called by Benthos after processing is complete.
 	// It writes the results back to the specific processor instance's channel.
 	w.logger.Debug(ctx).Int("batch_size", len(msgs)).Msg("Benthos output WriteBatch called")
@@ -725,8 +753,9 @@ func (w *conduitBatchOutputWrapper) WriteBatch(ctx context.Context, msgs service
 	}
 }
 
-func (w *conduitBatchOutputWrapper) Close(ctx context.Context) error {
-	w.logger.Debug(ctx).Msg("Benthos batch output closing")
+// Close implements both service.BatchInput.Close and service.BatchOutput.Close
+func (w *conduitBenthosWrapper) Close(ctx context.Context) error {
+	w.logger.Debug(ctx).Str("role", w.role).Msg("Benthos component closing")
 	// No specific closing needed
 	return nil
 }

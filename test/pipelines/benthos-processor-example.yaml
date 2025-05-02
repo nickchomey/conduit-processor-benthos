@@ -33,7 +33,7 @@ pipelines:
         settings:
           sdk.schema.encode.key.enabled: "false"
           sdk.schema.encode.payload.enabled: "false"
-          benthosYAML: |
+          yaml: |
             processors:
               - mapping: |
                   # This is a Benthos Bloblang mapping that converts the payload to uppercase
@@ -76,7 +76,7 @@ pipelines:
         settings:
           sdk.schema.encode.key.enabled: "false"
           sdk.schema.encode.payload.enabled: "false"
-          benthosYAML: |
+          yaml: |
             processors:
               - mapping: |
                   # This is a Benthos Bloblang mapping that converts the payload to uppercase

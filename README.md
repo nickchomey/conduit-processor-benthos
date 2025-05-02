@@ -291,15 +291,109 @@ For more details on Bloblang, see the [official documentation](https://benthos.d
 
 ### Hot Reloading Configuration
 
-The processor supports updating the Benthos configuration at runtime:
+The processor supports updating the Benthos configuration at runtime. You can configure all aspects of the Benthos stream through a single comprehensive configuration:
+
+### Configuration Structure
+
+The Benthos processor configuration is a single YAML string that includes all Benthos configuration except for the input/output sections (which are handled automatically):
+
+```yaml
+# Complete Benthos configuration (excluding input/output)
+yaml: |
+  # Pipeline section with processors
+  pipeline:
+    processors:
+      - mapping: |
+          root = this
+          root.payload.after = this.payload.after.string().capitalize().bytes()
+
+  # Resources section
+  resources:
+    caches:
+      - label: my_cache
+        memory: {}
+    rate_limits:
+      - label: my_rate_limit
+        local:
+          count: 10
+          interval: 1s
+
+  # Buffer configuration
+  buffer:
+    memory:
+      limit: 10000000
+
+  # Metrics configuration
+  metrics:
+    prometheus:
+      prefix: benthos
+
+  # Tracer configuration
+  tracer:
+    jaeger:
+      agent_address: localhost:6831
+      service_name: benthos
+
+  # Logger configuration
+  logger:
+    level: DEBUG
+
+# Thread count (handled separately)
+threadCount: 4
+```
+
+### Updating Configuration in Code
+
+You can update the configuration programmatically by calling `SetupBenthosStream`:
 
 ```go
-// Update the processor configuration without restarting
-err := processor.UpdateBenthosStream(ctx, newBenthosYAML)
+// Update the configuration with a complete YAML string
+completeYAML := `
+pipeline:
+  processors:
+    - mapping: |
+        root = this
+        root.payload.after = this.payload.after.string().capitalize().bytes()
+
+resources:
+  caches:
+    - label: my_cache
+      memory: {}
+  rate_limits:
+    - label: my_rate_limit
+      local:
+        count: 10
+        interval: 1s
+
+logger:
+  level: DEBUG
+`
+
+err := processor.SetupBenthosStream(ctx, benthosproc.BenthosConfig{
+    YAML: completeYAML,
+    ThreadCount: 4,
+})
 if err != nil {
     log.Fatalf("Failed to update configuration: %v", err)
 }
 ```
+
+The `SetupBenthosStream` method simply combines your YAML with the input/output configuration and sets up the Benthos stream. This approach is much simpler and more flexible than having separate methods for each configuration aspect.
+
+### Updating Configuration via NATS API
+
+You can update the configuration using the NATS API:
+
+```bash
+# Update the complete configuration
+nats req 'server-{serverid}.benthos.updateStream' '{
+  "processorId": "pipeline-id:processor-id",
+  "yaml": "pipeline:\n  processors:\n    - mapping: |\n        root = this\n        root.payload.after = this.payload.after.string().capitalize().bytes()\n\nresources:\n  caches:\n    - label: my_cache\n      memory: {}\n  rate_limits:\n    - label: my_rate_limit\n      local:\n        count: 10\n        interval: 1s\n\nbuffer:\n  memory:\n    limit: 10000000\n\nmetrics:\n  prometheus:\n    prefix: benthos\n\ntracer:\n  jaeger:\n    agent_address: localhost:6831\n    service_name: benthos\n\nlogger:\n  level: DEBUG",
+  "threadCount": 4
+}'
+```
+
+The `updateStream` endpoint is the only endpoint available for updating the Benthos configuration. It provides a simple way to update the entire Benthos configuration in a single call.
 
 ## Known Issues & Limitations
 

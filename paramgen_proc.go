@@ -8,43 +8,41 @@ import (
 )
 
 const (
-	ProcessorConfigBenthosYAML = "benthosYAML"
-	ProcessorConfigBufferSize  = "bufferSize"
-	ProcessorConfigThreadCount = "threadCount"
-	ProcessorConfigLogLevel    = "logLevel"
+	BenthosConfigBatchSize         = "batchSize"
+	BenthosConfigChannelBufferSize = "channelBufferSize"
+	BenthosConfigThreadCount       = "threadCount"
+	BenthosConfigYaml              = "yaml"
 )
 
-func (ProcessorConfig) Parameters() map[string]config.Parameter {
+func (BenthosConfig) Parameters() map[string]config.Parameter {
 	return map[string]config.Parameter{
-		ProcessorConfigBenthosYAML: {
+		BenthosConfigBatchSize: {
+			Default:     "100",
+			Description: "BatchSize controls the maximum number of records to process in a single Benthos batch\nHigher values can improve throughput but may increase memory usage",
+			Type:        config.ParameterTypeInt,
+			Validations: []config.Validation{
+				config.ValidationGreaterThan{V: 0},
+			},
+		},
+		BenthosConfigChannelBufferSize: {
+			Default:     "10",
+			Description: "ChannelBufferSize controls the size of internal channels for communication\nHigher values can improve throughput but use more memory",
+			Type:        config.ParameterTypeInt,
+			Validations: []config.Validation{},
+		},
+		BenthosConfigThreadCount: {
+			Default:     "1",
+			Description: "ThreadCount controls the number of parallel processing threads in the Benthos pipeline\nHigher values can improve throughput for CPU-bound processors",
+			Type:        config.ParameterTypeInt,
+			Validations: []config.Validation{},
+		},
+		BenthosConfigYaml: {
 			Default:     "",
-			Description: "YAML configuration for the Benthos processors section",
+			Description: "YAML is the complete Benthos configuration (excluding input/output)\nThis includes processors, resources, buffer, metrics, etc.",
 			Type:        config.ParameterTypeString,
 			Validations: []config.Validation{
 				config.ValidationRequired{},
 			},
-		},
-		ProcessorConfigBufferSize: {
-			Default:     "10",
-			Description: "Size of internal channels for processing records",
-			Type:        config.ParameterTypeInt,
-			Validations: []config.Validation{
-				config.ValidationGreaterThan{V: 0},
-			},
-		},
-		ProcessorConfigThreadCount: {
-			Default:     "1",
-			Description: "Number of parallel processing threads in the Benthos pipeline",
-			Type:        config.ParameterTypeInt,
-			Validations: []config.Validation{
-				config.ValidationGreaterThan{V: 0},
-			},
-		},
-		ProcessorConfigLogLevel: {
-			Default:     "INFO",
-			Description: "Controls the verbosity of Benthos internal logs",
-			Type:        config.ParameterTypeString,
-			Validations: []config.Validation{},
 		},
 	}
 }
